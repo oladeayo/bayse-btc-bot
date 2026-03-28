@@ -13,6 +13,28 @@ from collections import deque
 from telegram import Bot
 from telegram.constants import ParseMode
 
+
+# ── Startup validation ───────────────────────────────────────
+import sys
+
+TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN", "")
+TELEGRAM_CHAT  = os.environ.get("TELEGRAM_CHAT", "")
+BAYSE_KEY      = os.environ.get("BAYSE_KEY", "")
+
+if not TELEGRAM_TOKEN:
+    print("ERROR: TELEGRAM_TOKEN environment variable is not set!", flush=True)
+    sys.exit(1)
+if not TELEGRAM_CHAT:
+    print("ERROR: TELEGRAM_CHAT environment variable is not set!", flush=True)
+    sys.exit(1)
+if not BAYSE_KEY:
+    print("ERROR: BAYSE_KEY environment variable is not set!", flush=True)
+    sys.exit(1)
+
+print(f"✅ Token loaded: {TELEGRAM_TOKEN[:10]}...", flush=True)
+print(f"✅ Chat ID: {TELEGRAM_CHAT}", flush=True)
+print(f"✅ Bayse key: {BAYSE_KEY[:10]}...", flush=True)
+
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
     format="%(asctime)s — %(levelname)s — %(message)s",
