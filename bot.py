@@ -248,8 +248,28 @@ def get_signal(market, feature_values, vol_regime):
     }
 
 # ── Message formatters ────────────────────────────────────────
-def format_signal_message(r):
+def format_signal_message(r, last_trade=None):
     win_rate = f"{stats['correct']/stats['total']*100:.1f}%" if stats['total'] > 0 else "N/A"
+    
+    # Build last trade result summary
+    if last_trade:
+        emoji  = "✅" if last_trade["correct"] else "❌"
+        conv   = "⚡" if last_trade["high_conviction"] else "⚠️"
+        last_trade_text = (
+            f"\n{'─' * 30}\n"
+            f"📋 *Last Round Result*\n"
+            f"  {emoji} Predicted: {'UP' if last_trade['direction_short'] == 'UP' else 'DOWN'} | "
+            f"Actual: {'UP 📈' if last_trade['actual'].lower() in ['up','yes'] else 'DOWN 📉'}\n"
+            f"  {conv} Confidence was: {last_trade['confidence']:.0%} | "
+            f"{'CORRECT' if last_trade['correct'] else 'WRONG'}\n"
+            f"  📊 Session: {stats['total']} rounds | {win_rate} win rate"
+        )
+    else:
+        last_trade_text = (
+            f"\n{'─' * 30}\n"
+            f"📋 *Last Round:* No previous round yet"
+        )
+
     return (
         f"🔔 *NEW BAYSE BTC ROUND*\n"
         f"{'─' * 30}\n"
@@ -267,9 +287,7 @@ def format_signal_message(r):
         f"{'─' * 30}\n"
         f"💡 *Reasons:*\n"
         + "\n".join([f"  • {x}" for x in r['reason'].split(' | ')]) +
-        f"\n{'─' * 30}\n"
-        f"📦 *Orders:* {r['total_orders']} | 💧 *Liquidity:* ${r['liquidity']:,.2f}\n"
-        f"📊 *Session:* {stats['total']} rounds | {win_rate} correct"
+        last_trade_text
     )
 
 def format_result_message(signal_r, resolved_outcome, final_price):
@@ -444,7 +462,8 @@ async def run_bot():
                     last_signal_result = result
                     last_event_id      = current_event_id
 
-                    msg = format_signal_message(result)
+                    last_trade = trade_log[-1] if trade_log else None
+                    msg = format_signal_message(result, last_trade)
                     await bot.send_message(
                         chat_id=TELEGRAM_CHAT,
                         text=msg,
