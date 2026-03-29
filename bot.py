@@ -14,7 +14,7 @@ from datetime import datetime, timezone, timedelta
 from collections import deque
 from telegram import Bot, Update
 from telegram.constants import ParseMode
-from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
+from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -393,26 +393,22 @@ def format_report_message():
         f"`{log_text}`"
     )
 
-# ── /stats command handler ────────────────────────────────────
-async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+def build_stats_message():
     now      = datetime.now(timezone.utc)
     win_rate = f"{stats['correct']/stats['total']*100:.1f}%" if stats['total'] > 0 else "N/A"
     hc_rate  = (f"{stats['high_conv_correct']/stats['high_conv_total']*100:.1f}%"
                 if stats['high_conv_total'] > 0 else "N/A")
 
-    # Last 10 trades
     last_10         = trade_log[-10:] if trade_log else []
     last_10_correct = sum(1 for t in last_10 if t["correct"])
     last_10_rate    = f"{last_10_correct/len(last_10)*100:.1f}%" if last_10 else "N/A"
 
-    # Last 1 hour trades
     one_hour_ago    = now - timedelta(hours=1)
     last_1h         = [t for t in trade_log
                        if datetime.fromisoformat(t["timestamp"]) > one_hour_ago]
     last_1h_correct = sum(1 for t in last_1h if t["correct"])
     last_1h_rate    = f"{last_1h_correct/len(last_1h)*100:.1f}%" if last_1h else "N/A"
 
-    # Build last 10 table
     lines = []
     for t in last_10:
         emoji = "✅" if t["correct"] else "❌"
@@ -423,7 +419,7 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         )
     table = "\n".join(lines) if lines else "No trades recorded yet"
 
-    msg = (
+    return (
         f"📊 *BOT STATS*\n"
         f"{'─' * 30}\n"
         f"🕐 *As of:* {now.strftime('%H:%M:%S UTC')}\n"
@@ -442,36 +438,16 @@ async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"  • Signals: {stats['high_conv_total']} | Win rate: {hc_rate}"
     )
 
-    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+# ── /stats command handler ────────────────────────────────────
+async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(build_stats_message(), parse_mode=ParseMode.MARKDOWN)
 
-# ── Main bot loop ─────────────────────────────────────────────
-async def run_bot():
+# ── Signal loop ───────────────────────────────────────────────
+async def signal_loop(bot):
     global last_event_id, pending_signal, pending_event_id
     global signal_fired, round_start_time, last_report_time
 
-    init_log_file()
-
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("stats", handle_stats))
-    await app.initialize()
-    await app.start()
-
-    bot = app.bot
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT,
-        text=(
-            "🤖 *Bayse BTC Bot is live!*\n"
-            f"Confidence threshold: {CONFIDENCE:.0%}\n"
-            f"Signal fires {SIGNAL_DELAY_MINS} mins into each round.\n"
-            f"Reports every {REPORT_INTERVAL_HOURS} hours.\n"
-            f"Type /stats anytime for performance summary."
-        ),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    log.info("Bot started")
     seed_candle_window()
-
-    await app.updater.start_polling()
 
     while True:
         try:
@@ -501,7 +477,6 @@ async def run_bot():
             if current_event_id != last_event_id:
                 log.info(f"New round: {current_event_id}")
 
-                # Check result of previous round by fetching its event ID directly
                 if pending_signal and pending_event_id:
                     log.info(f"Checking result for: {pending_event_id}")
                     prev = fetch_event_by_id(pending_event_id)
@@ -554,13 +529,12 @@ async def run_bot():
                     else:
                         log.warning(f"No resolved outcome for {pending_event_id} yet")
 
-                # Reset for new round
                 last_event_id    = current_event_id
                 signal_fired     = False
                 round_start_time = now
                 pending_event_id = current_event_id
 
-            # ── Fire signal after SIGNAL_DELAY_MINS ──────────
+            # ── Fire signal after delay ───────────────────────
             if not signal_fired and round_start_time:
                 mins_into_round = (now - round_start_time).total_seconds() / 60
                 if mins_into_round >= SIGNAL_DELAY_MINS:
@@ -587,8 +561,35 @@ async def run_bot():
             await asyncio.sleep(30)
 
         except Exception as e:
-            log.error(f"Bot error: {e}", exc_info=True)
+            log.error(f"Signal loop error: {e}", exc_info=True)
             await asyncio.sleep(60)
 
+# ── Main ──────────────────────────────────────────────────────
+async def main():
+    init_log_file()
+
+    app = Application.builder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("stats", handle_stats))
+
+    await app.initialize()
+    await app.start()
+    await app.updater.start_polling(drop_pending_updates=True)
+
+    bot = app.bot
+    await bot.send_message(
+        chat_id=TELEGRAM_CHAT,
+        text=(
+            "🤖 *Bayse BTC Bot is live!*\n"
+            f"Confidence threshold: {CONFIDENCE:.0%}\n"
+            f"Signal fires {SIGNAL_DELAY_MINS} mins into each round.\n"
+            f"Reports every {REPORT_INTERVAL_HOURS} hours.\n"
+            "Type /stats anytime for performance summary."
+        ),
+        parse_mode=ParseMode.MARKDOWN
+    )
+    log.info("Bot started")
+
+    await signal_loop(bot)
+
 if __name__ == "__main__":
-    asyncio.run(run_bot())
+    asyncio.run(main())
