@@ -26,7 +26,8 @@ TELEGRAM_CHAT         = os.environ.get("TELEGRAM_CHAT", "")
 BAYSE_KEY             = os.environ.get("BAYSE_KEY", "")
 BASE_URL              = "https://relay.bayse.markets/v1"
 BAYSE_HEADERS         = {"X-Public-Key": BAYSE_KEY}
-CONFIDENCE            = 0.58
+CONFIDENCE            = 0.70
+FEE                   = 0.05
 REPORT_INTERVAL_HOURS = 12
 SIGNAL_DELAY_MINS     = 5
 LOG_FILE              = "trade_log.csv"
@@ -47,31 +48,32 @@ print(f"✅ Token: {TELEGRAM_TOKEN[:10]}...", flush=True)
 print(f"✅ Chat: {TELEGRAM_CHAT}", flush=True)
 
 # ── Load model ───────────────────────────────────────────────
-model    = joblib.load("btc_bayse_model_6m.joblib")
-features = json.load(open("features.json"))
-print("✅ Model loaded", flush=True)
+model    = joblib.load("btc_bayse_model_v2.joblib")
+features = json.load(open("features_v2.json"))
+print(f"✅ Model loaded | {len(features)} features", flush=True)
 
 # ── State ─────────────────────────────────────────────────────
 CANDLE_WINDOW        = deque(maxlen=100)
-last_event_id        = None       # event ID of current round
-prev_event_id        = None       # event ID of previous round (for result lookup)
-pending_signal       = None       # signal sent 5 mins in
-signal_fired         = False      # has signal been sent this round
-round_start_time     = None       # when current round was detected
-open_alert_sent      = False      # has the open alert been sent this round
+current_round        = {
+    "event_id"         : None,
+    "start_time"       : None,
+    "round_start_price": None,   # Bayse target price
+    "signal_fired"     : False,
+    "open_alert_sent"  : False,
+    "pending_signal"   : None,   # signal result dict
+}
+prev_round           = {
+    "event_id"         : None,
+    "round_start_price": None,
+    "final_price"      : None,
+    "bot_direction"    : None,   # "UP" or "DOWN"
+    "actual_direction" : None,   # "UP" or "DOWN"
+    "would_have_won"   : None,
+    "resolved"         : False,
+}
 last_report_time     = datetime.now(timezone.utc)
 last_update_id       = None
-current_market_cache = None       # cache of current market for /price /trade
-
-# Last round result for displaying in open alert
-last_round = {
-    "target"        : None,
-    "final_price"   : None,
-    "direction"     : None,   # UP or DOWN (what actually happened)
-    "bot_prediction": None,   # UP or DOWN (what bot said)
-    "would_have_won": None,   # True/False
-    "resolved"      : False
-}
+current_market_cache = None
 
 stats = {
     "total"            : 0,
@@ -80,22 +82,24 @@ stats = {
     "high_conv_total"  : 0,
     "high_conv_correct": 0,
 }
-
 trade_log = []
 
 # ── Telegram helpers ──────────────────────────────────────────
 def tg_send(text, chat_id=None):
     try:
-        cid = chat_id or TELEGRAM_CHAT
         r = requests.post(
             f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": cid, "text": text, "parse_mode": "Markdown"},
+            json={
+                "chat_id"   : chat_id or TELEGRAM_CHAT,
+                "text"      : text,
+                "parse_mode": "Markdown"
+            },
             timeout=10
         )
         if not r.ok:
-            log.error(f"Telegram send error: {r.status_code} {r.text[:200]}")
+            log.error(f"TG send error: {r.status_code} {r.text[:150]}")
     except Exception as e:
-        log.error(f"Telegram send exception: {e}")
+        log.error(f"TG send exception: {e}")
 
 def tg_get_updates():
     global last_update_id
@@ -110,203 +114,201 @@ def tg_get_updates():
                 last_update_id = u["update_id"]
             return updates
     except Exception as e:
-        log.error(f"Telegram poll error: {e}")
+        log.error(f"TG poll error: {e}")
     return []
 
 def handle_commands():
-    updates = tg_get_updates()
-    for update in updates:
+    for update in tg_get_updates():
         msg     = update.get("message", {})
         text    = msg.get("text", "").strip().lower()
         chat_id = str(msg.get("chat", {}).get("id", ""))
+        if   text.startswith("/price"): cmd_price(chat_id)
+        elif text.startswith("/trade"): cmd_trade(chat_id)
+        elif text.startswith("/stats"): tg_send(build_stats_message(), chat_id)
+        elif text.startswith("/start"): tg_send(start_message(), chat_id)
 
-        if text.startswith("/price"):
-            handle_price(chat_id)
-        elif text.startswith("/trade"):
-            handle_trade_cmd(chat_id)
-        elif text.startswith("/stats"):
-            tg_send(build_stats_message(), chat_id=chat_id)
-        elif text.startswith("/start"):
-            tg_send(
-                "🤖 *Bayse BTC Bot*\n\n"
-                "Commands:\n"
-                "  /price — current BTC vs target\n"
-                "  /trade — current Yes/No % on Bayse\n"
-                "  /stats — performance summary\n\n"
-                f"Confidence threshold: {CONFIDENCE:.0%}\n"
-                f"Signal fires {SIGNAL_DELAY_MINS} mins into each round.",
-                chat_id=chat_id
-            )
+def start_message():
+    return (
+        "🤖 *Bayse BTC Bot*\n\n"
+        "I monitor every BTC round on Bayse and send:\n"
+        "  1️⃣ Open alert when round starts\n"
+        "  2️⃣ Trade signal 5 mins in\n\n"
+        "Commands:\n"
+        "  /price — current BTC vs target\n"
+        "  /trade — current Yes/No % on Bayse\n"
+        "  /stats — performance summary\n\n"
+        f"Confidence threshold: {CONFIDENCE:.0%} | Fee: {FEE:.0%}"
+    )
 
-def handle_price(chat_id):
-    now = datetime.now(timezone.utc)
+def cmd_price(chat_id):
     btc = CANDLE_WINDOW[-1]["close"] if CANDLE_WINDOW else None
-    if current_market_cache and btc:
-        rules        = current_market_cache.get("rules", "")
-        price_match  = re.findall(r'\$([\d,]+\.?\d*)', rules)
-        price_target = float(price_match[0].replace(",", "")) if price_match else None
-        if price_target:
-            diff     = btc - price_target
-            diff_pct = (diff / price_target) * 100
-            status   = "📈 ABOVE target" if diff > 0 else "📉 BELOW target"
-            tg_send(
-                f"💰 *BTC Price Check*\n"
-                f"{'─' * 25}\n"
-                f"  Current:  ${btc:,.2f}\n"
-                f"  Target:   ${price_target:,.2f}\n"
-                f"  Diff:     ${diff:+.2f} ({diff_pct:+.3f}%)\n"
-                f"  Status:   {status}\n"
-                f"  Time:     {now.strftime('%H:%M:%S UTC')}",
-                chat_id=chat_id
-            )
-            return
-    tg_send("⚠️ No active round data yet.", chat_id=chat_id)
-
-def handle_trade_cmd(chat_id):
-    if current_market_cache:
-        yes = current_market_cache.get("yes_price", 0)
-        no  = current_market_cache.get("no_price", 0)
-        orders = current_market_cache.get("total_orders", 0)
-        liq    = current_market_cache.get("liquidity", 0)
-        now = datetime.now(timezone.utc)
+    target = current_round.get("round_start_price")
+    now = datetime.now(timezone.utc)
+    if btc and target:
+        diff     = btc - target
+        diff_pct = (diff / target) * 100
+        arrow    = "📈 ABOVE" if diff > 0 else "📉 BELOW"
         tg_send(
-            f"📊 *Current Bayse Market*\n"
-            f"{'─' * 25}\n"
-            f"  YES (UP):  {yes:.0%}\n"
-            f"  NO (DOWN): {no:.0%}\n"
-            f"  Orders:    {orders}\n"
-            f"  Liquidity: ${liq:,.2f}\n"
-            f"  Time:      {now.strftime('%H:%M:%S UTC')}",
-            chat_id=chat_id
+            f"💰 *BTC vs Target*\n"
+            f"{'─'*25}\n"
+            f"  Current : ${btc:,.2f}\n"
+            f"  Target  : ${target:,.2f}\n"
+            f"  Gap     : ${diff:+.2f} ({diff_pct:+.3f}%)\n"
+            f"  Status  : {arrow} target\n"
+            f"  Time    : {now.strftime('%H:%M:%S UTC')}",
+            chat_id
         )
     else:
-        tg_send("⚠️ No active round data yet.", chat_id=chat_id)
+        tg_send("⚠️ No active round data yet.", chat_id)
 
-# ── Trade log CSV ─────────────────────────────────────────────
-def init_log_file():
+def cmd_trade(chat_id):
+    m = current_market_cache
+    if m:
+        yes = m.get("yes_price", 0)
+        no  = m.get("no_price", 0)
+        tg_send(
+            f"📊 *Bayse Market Now*\n"
+            f"{'─'*25}\n"
+            f"  YES (UP)  : {yes:.0%}\n"
+            f"  NO (DOWN) : {no:.0%}\n"
+            f"  Orders    : {m.get('total_orders', 0)}\n"
+            f"  Liquidity : ${m.get('liquidity', 0):,.2f}\n"
+            f"  Time      : {datetime.now(timezone.utc).strftime('%H:%M:%S UTC')}",
+            chat_id
+        )
+    else:
+        tg_send("⚠️ No active round data yet.", chat_id)
+
+# ── Trade log ─────────────────────────────────────────────────
+def init_log():
     if not os.path.exists(LOG_FILE):
         with open(LOG_FILE, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow([
-                "timestamp", "direction", "confidence", "conviction",
-                "actual_outcome", "correct", "btc_price", "price_target",
-                "yes_price", "edge", "mins_remaining_at_signal"
+            csv.writer(f).writerow([
+                "timestamp", "round_start_price", "final_price",
+                "direction", "confidence", "conviction",
+                "actual_outcome", "correct",
+                "price_vs_target_pct", "edge"
             ])
 
-def append_to_log(entry):
+def write_log(entry):
     with open(LOG_FILE, "a", newline="") as f:
-        writer = csv.writer(f)
-        writer.writerow([
-            entry["timestamp"], entry["direction_short"], entry["confidence"],
-            "HIGH" if entry["high_conviction"] else "LOW",
-            entry["actual"], entry["correct"],
-            entry.get("btc_price", ""), entry.get("price_target", ""),
-            entry.get("yes_price", ""), entry.get("edge", ""),
-            entry.get("mins_remaining", "")
+        csv.writer(f).writerow([
+            entry["timestamp"],
+            entry.get("round_start_price", ""),
+            entry.get("final_price", ""),
+            entry.get("direction_short", ""),
+            entry.get("confidence", ""),
+            "HIGH" if entry.get("high_conviction") else "LOW",
+            entry.get("actual", ""),
+            entry.get("correct", ""),
+            entry.get("price_vs_target_pct", ""),
+            entry.get("edge", ""),
         ])
 
 # ── KuCoin ────────────────────────────────────────────────────
-def seed_candle_window():
-    url    = "https://api.kucoin.com/api/v1/market/candles"
-    params = {"symbol": "BTC-USDT", "type": "1min"}
-    r      = requests.get(url, params=params, timeout=10)
-    data   = r.json().get("data", [])
-    for c in reversed(data):
-        CANDLE_WINDOW.append({
-            "open_time": pd.Timestamp(int(c[0]), unit="s", tz="UTC"),
-            "open"     : float(c[1]),
-            "close"    : float(c[2]),
-            "high"     : float(c[3]),
-            "low"      : float(c[4]),
-            "volume"   : float(c[5])
-        })
-    log.info(f"Seeded {len(CANDLE_WINDOW)} candles | BTC: ${CANDLE_WINDOW[-1]['close']:,.2f}")
-
-def update_candle_window():
+def seed_candles():
     try:
-        url    = "https://api.kucoin.com/api/v1/market/candles"
-        params = {"symbol": "BTC-USDT", "type": "1min", "pageSize": 3}
-        r      = requests.get(url, params=params, timeout=5)
-        data   = r.json().get("data", [])
+        r    = requests.get("https://api.kucoin.com/api/v1/market/candles",
+                            params={"symbol": "BTC-USDT", "type": "1min"}, timeout=10)
+        data = r.json().get("data", [])
+        for c in reversed(data):
+            CANDLE_WINDOW.append({
+                "open_time": pd.Timestamp(int(c[0]), unit="s", tz="UTC"),
+                "open": float(c[1]), "close": float(c[2]),
+                "high": float(c[3]), "low": float(c[4]), "volume": float(c[5])
+            })
+        log.info(f"Seeded {len(CANDLE_WINDOW)} candles | ${CANDLE_WINDOW[-1]['close']:,.2f}")
+    except Exception as e:
+        log.error(f"Seed error: {e}")
+
+def update_candles():
+    try:
+        r    = requests.get("https://api.kucoin.com/api/v1/market/candles",
+                            params={"symbol": "BTC-USDT", "type": "1min", "pageSize": 3}, timeout=5)
+        data = r.json().get("data", [])
         if not data:
             return
+        c = data[0]
         latest = {
-            "open_time": pd.Timestamp(int(data[0][0]), unit="s", tz="UTC"),
-            "open"     : float(data[0][1]),
-            "close"    : float(data[0][2]),
-            "high"     : float(data[0][3]),
-            "low"      : float(data[0][4]),
-            "volume"   : float(data[0][5])
+            "open_time": pd.Timestamp(int(c[0]), unit="s", tz="UTC"),
+            "open": float(c[1]), "close": float(c[2]),
+            "high": float(c[3]), "low": float(c[4]), "volume": float(c[5])
         }
         if not CANDLE_WINDOW or latest["open_time"] > CANDLE_WINDOW[-1]["open_time"]:
             CANDLE_WINDOW.append(latest)
     except Exception as e:
-        log.error(f"KuCoin update error: {e}")
+        log.error(f"Update candles error: {e}")
+
+def get_btc_price():
+    return CANDLE_WINDOW[-1]["close"] if CANDLE_WINDOW else None
 
 # ── Bayse ─────────────────────────────────────────────────────
-def fetch_btc_bayse_market():
+def fetch_btc_market():
     try:
         r      = requests.get(f"{BASE_URL}/pm/events", headers=BAYSE_HEADERS,
                               params={"limit": 50}, timeout=10)
         events = r.json().get("events", [])
         for event in events:
-            title = event.get("title", "").lower()
-            if "bitcoin" in title and "15" in title:
-                r2      = requests.get(f"{BASE_URL}/pm/events/{event['id']}",
-                                       headers=BAYSE_HEADERS, timeout=10)
-                detail  = r2.json()
-                markets = detail.get("markets", [])
-                if markets:
-                    m = markets[0]
+            if "bitcoin" in event.get("title", "").lower() and "15" in event.get("title", ""):
+                r2     = requests.get(f"{BASE_URL}/pm/events/{event['id']}",
+                                      headers=BAYSE_HEADERS, timeout=10)
+                detail = r2.json()
+                ms     = detail.get("markets", [])
+                if ms:
+                    m = ms[0]
                     return {
                         "event_id"        : detail["id"],
-                        "event_title"     : detail["title"],
-                        "market_id"       : m["id"],
                         "yes_price"       : m.get("outcome1Price", 0),
                         "no_price"        : m.get("outcome2Price", 0),
                         "total_orders"    : m.get("totalOrders", 0),
-                        "status"          : m.get("status"),
                         "liquidity"       : detail.get("liquidity", 0),
                         "created_at"      : detail.get("createdAt", ""),
                         "rules"           : m.get("rules", ""),
-                        "resolved_outcome": m.get("resolvedOutcome", "")
+                        "resolved_outcome": m.get("resolvedOutcome", ""),
+                        "status"          : m.get("status", ""),
                     }
     except Exception as e:
         log.error(f"Bayse fetch error: {e}")
     return None
 
-def fetch_resolved_outcome(event_id):
-    """Fetch a specific past event to get its resolved outcome."""
+def fetch_market_by_id(event_id):
     try:
         r      = requests.get(f"{BASE_URL}/pm/events/{event_id}",
                               headers=BAYSE_HEADERS, timeout=10)
         detail = r.json()
-        markets = detail.get("markets", [])
-        if markets:
-            m = markets[0]
+        ms     = detail.get("markets", [])
+        if ms:
+            m = ms[0]
             return {
                 "resolved_outcome": m.get("resolvedOutcome", ""),
                 "status"          : m.get("status", ""),
-                "yes_price"       : m.get("outcome1Price", 0),
             }
     except Exception as e:
-        log.error(f"Fetch resolved error: {e}")
+        log.error(f"Fetch by ID error: {e}")
     return None
 
-def parse_price_target(rules):
-    price_match = re.findall(r'\$([\d,]+\.?\d*)', rules)
-    return float(price_match[0].replace(",", "")) if price_match else None
+def parse_target(rules):
+    m = re.findall(r'\$([\d,]+\.?\d*)', rules)
+    return float(m[0].replace(",", "")) if m else None
 
-def parse_end_time(rules, now):
-    end_match = re.search(r'(\d+:\d+:\d+\s?[AP]M)\s?GMT', rules)
-    if end_match:
-        today  = now.strftime("%Y-%m-%d")
-        end_dt = datetime.strptime(f"{today} {end_match.group(1).strip()}", "%Y-%m-%d %I:%M:%S %p")
-        return end_dt.replace(tzinfo=timezone.utc)
+def parse_end_dt(rules, now):
+    m = re.search(r'(\d+:\d+:\d+\s?[AP]M)\s?GMT', rules)
+    if m:
+        try:
+            end = datetime.strptime(
+                f"{now.strftime('%Y-%m-%d')} {m.group(1).strip()}",
+                "%Y-%m-%d %I:%M:%S %p"
+            ).replace(tzinfo=timezone.utc)
+            # Handle midnight crossover
+            if (end - now).total_seconds() < -3600:
+                end += timedelta(days=1)
+            return end
+        except Exception:
+            pass
     return None
 
 # ── Features ──────────────────────────────────────────────────
-def compute_features():
+def compute_features(round_start_price):
     if len(CANDLE_WINDOW) < 60:
         return None, None
     df = pd.DataFrame(list(CANDLE_WINDOW)).sort_values("open_time").reset_index(drop=True)
@@ -329,334 +331,336 @@ def compute_features():
         df["obv"]          = ta.volume.OnBalanceVolumeIndicator(df["close"], df["volume"]).on_balance_volume()
         df["obv_slope"]    = df["obv"].diff(5)
         df["candle_body"]  = (df["close"] - df["open"]) / df["open"]
-        df["upper_wick"]   = (df["high"] - df[["close","open"]].max(axis=1)) / df["open"]
-        df["lower_wick"]   = (df[["close","open"]].min(axis=1) - df["low"]) / df["open"]
         df["momentum_1"]   = df["close"].pct_change(1)
         df["momentum_3"]   = df["close"].pct_change(3)
         df["momentum_5"]   = df["close"].pct_change(5)
-        df["momentum_15"]  = df["close"].pct_change(15)
-        df["momentum_30"]  = df["close"].pct_change(30)
         df["rolling_std_15"] = df["close"].pct_change().rolling(15).std()
         df["rolling_std_60"] = df["close"].pct_change().rolling(60).std()
         df["hour"]         = df["open_time"].dt.hour
         df["dayofweek"]    = df["open_time"].dt.dayofweek
-        df["minute"]       = df["open_time"].dt.minute
-        latest = df.iloc[-1]
+
+        latest = df.iloc[-1].copy()
+
+        # Bayse-specific features using actual round start price
+        if round_start_price and round_start_price > 0:
+            price_vs_target     = (latest["close"] - round_start_price) / round_start_price
+            price_gap_usd       = latest["close"] - round_start_price
+            gap_vs_atr          = price_gap_usd / (latest["atr"] + 1e-8)
+            gap_pct_abs         = abs(price_vs_target)
+            early_momentum      = price_vs_target
+            rsi_vs_neutral      = latest["rsi_14"] - 50
+        else:
+            price_vs_target = price_gap_usd = gap_vs_atr = gap_pct_abs = early_momentum = rsi_vs_neutral = 0.0
+
+        latest["price_vs_target"]  = price_vs_target
+        latest["price_gap_usd"]    = price_gap_usd
+        latest["gap_vs_atr"]       = gap_vs_atr
+        latest["gap_pct_abs"]      = gap_pct_abs
+        latest["early_momentum"]   = early_momentum
+        latest["rsi_vs_neutral"]   = rsi_vs_neutral
+
         return latest[features].values, latest["rolling_std_60"]
+
     except Exception as e:
         log.error(f"Feature error: {e}")
         return None, None
 
 # ── Signal ────────────────────────────────────────────────────
-def get_signal(market, feature_values, vol_regime, now):
-    current_price = CANDLE_WINDOW[-1]["close"]
-    rules         = market.get("rules", "")
-    price_target  = parse_price_target(rules)
-    end_dt        = parse_end_time(rules, now)
-
+def get_signal(market, round_start_price, now):
+    rules          = market.get("rules", "")
+    end_dt         = parse_end_dt(rules, now)
+    btc            = get_btc_price()
     mins_remaining = round((end_dt - now).total_seconds() / 60, 1) if end_dt else None
     secs_remaining = (end_dt - now).total_seconds() if end_dt else 999
-    price_diff     = (current_price - price_target) if price_target else 0
-    price_diff_pct = (price_diff / price_target * 100) if price_target else 0
 
-    feat_df = pd.DataFrame([feature_values], columns=features)
+    price_diff     = (btc - round_start_price) if (btc and round_start_price) else 0
+    price_diff_pct = (price_diff / round_start_price * 100) if round_start_price else 0
+
+    feat_vals, vol_regime = compute_features(round_start_price)
+    if feat_vals is None:
+        return None
+
+    feat_df = pd.DataFrame([feat_vals], columns=features)
     proba   = model.predict_proba(feat_df)[0][1]
     edge    = abs(proba - market["yes_price"])
 
     direction  = "BUY YES (UP) 📈" if proba > 0.5 else "BUY NO (DOWN) 📉"
-    conviction = "⚡ HIGH CONVICTION" if (proba > CONFIDENCE or proba < (1 - CONFIDENCE)) else "⚠️ LOW CONVICTION"
+    conviction = "⚡ HIGH" if (proba > CONFIDENCE or proba < (1 - CONFIDENCE)) else "⚠️ LOW"
 
-    if vol_regime > 0.003:
+    if vol_regime and vol_regime > 0.003:
         signal = "⛔ NO TRADE"
-        reason = "Volatility too high — model unreliable"
+        reason = "Volatility too high"
     elif 0 < secs_remaining < 120:
         signal = "⛔ NO TRADE"
-        reason = f"Only {secs_remaining:.0f}s left — too late"
+        reason = f"Only {secs_remaining:.0f}s left"
     elif proba > CONFIDENCE or proba < (1 - CONFIDENCE):
         signal = "✅ TRADE"
+        gap_status = f"${price_diff:+.2f} ({price_diff_pct:+.3f}%) vs target"
         reasons = [
-            f"Model confidence: {proba:.1%} {'UP' if proba > 0.5 else 'DOWN'}",
-            f"RSI & momentum align with {'bullish' if proba > 0.5 else 'bearish'} signal",
-            f"BTC ${price_diff:+.2f} ({price_diff_pct:+.3f}%) vs round start price",
-            f"Edge over market: {edge:.1%}"
+            f"Model: {proba:.1%} {'UP' if proba > 0.5 else 'DOWN'}",
+            f"BTC {gap_status}",
+            f"Gap/ATR ratio: {price_diff/(feat_vals[features.index('atr')] + 1e-8):.2f}x",
+            f"Edge: {edge:.1%}"
         ]
         reason = " | ".join(reasons)
     else:
         signal = "⛔ NO TRADE"
-        reason = f"Confidence {proba:.1%} below {CONFIDENCE:.0%} threshold"
+        reason = f"Confidence {proba:.1%} below {CONFIDENCE:.0%}"
 
     return {
-        "signal"        : signal,
-        "direction"     : direction,
-        "conviction"    : conviction,
-        "confidence"    : round(proba, 4),
-        "edge"          : round(edge, 4),
-        "current_price" : current_price,
-        "price_target"  : price_target,
-        "price_diff"    : round(price_diff, 2),
-        "price_diff_pct": round(price_diff_pct, 4),
-        "mins_remaining": mins_remaining,
-        "yes_price"     : market["yes_price"],
-        "no_price"      : market["no_price"],
-        "total_orders"  : market["total_orders"],
-        "liquidity"     : market["liquidity"],
-        "reason"        : reason,
-        "event_id"      : market["event_id"],
-        "timestamp"     : now.isoformat()
+        "signal"           : signal,
+        "direction"        : direction,
+        "direction_short"  : "UP" if proba > 0.5 else "DOWN",
+        "conviction"       : conviction,
+        "confidence"       : round(proba, 4),
+        "edge"             : round(edge, 4),
+        "btc_price"        : btc,
+        "round_start_price": round_start_price,
+        "price_diff"       : round(price_diff, 2),
+        "price_diff_pct"   : round(price_diff_pct, 4),
+        "mins_remaining"   : mins_remaining,
+        "yes_price"        : market["yes_price"],
+        "no_price"         : market["no_price"],
+        "reason"           : reason,
+        "timestamp"        : now.isoformat(),
+        "high_conviction"  : signal == "✅ TRADE",
     }
 
-# ── Message formatters ────────────────────────────────────────
-def format_open_alert(market, btc_price, price_target, now):
-    """Message 1 — fires immediately when new round detected."""
-    end_dt         = parse_end_time(market.get("rules", ""), now)
-    mins_remaining = round((end_dt - now).total_seconds() / 60, 1) if end_dt else "?"
-    diff           = btc_price - price_target if price_target else 0
-    diff_pct       = (diff / price_target * 100) if price_target else 0
+# ── Messages ──────────────────────────────────────────────────
+def msg_open_alert(market, btc, target, now, mins_remaining):
+    """Fires immediately when new round opens."""
+    diff     = btc - target if (btc and target) else 0
+    diff_pct = (diff / target * 100) if target else 0
 
-    # Last round result block
-    if last_round["resolved"] and last_round["target"] and last_round["final_price"]:
-        actual_diff  = last_round["final_price"] - last_round["target"]
-        actual_dir   = "UP 📈" if actual_diff >= 0 else "DOWN 📉"
-        won_icon     = "✅ WON" if last_round["would_have_won"] else "❌ LOST"
-        bot_said     = last_round["bot_prediction"] or "N/A"
+    if prev_round["resolved"] and prev_round["round_start_price"]:
+        p_target = prev_round["round_start_price"]
+        p_final  = prev_round["final_price"] or btc
+        p_diff   = p_final - p_target
+        p_dir    = "UP 📈" if p_diff >= 0 else "DOWN 📉"
+        won_txt  = "✅ WON" if prev_round["would_have_won"] else "❌ LOST"
+        wr       = f"{stats['correct']/stats['total']*100:.1f}%" if stats["total"] > 0 else "N/A"
         last_block = (
-            f"{'─' * 30}\n"
+            f"{'─'*30}\n"
             f"📋 *Last Round*\n"
-            f"  Target:    ${last_round['target']:,.2f}\n"
-            f"  Final BTC: ${last_round['final_price']:,.2f} → {actual_dir}\n"
-            f"  Bot said:  {bot_said} → {won_icon}\n"
-            f"  📊 Session: {stats['total']} rounds | "
-            f"{stats['correct']/stats['total']*100:.1f}% win rate\n"
+            f"  Target → Final: ${p_target:,.2f} → ${p_final:,.2f}\n"
+            f"  Result: {p_dir}\n"
+            f"  Bot said: {prev_round['bot_direction']} → {won_txt}\n"
+            f"  Session: {stats['total']} rounds | {wr} WR\n"
         )
     else:
-        last_block = (
-            f"{'─' * 30}\n"
-            f"📋 *Last Round:* No data yet\n"
-        )
+        last_block = f"{'─'*30}\n📋 *Last Round:* No data yet\n"
 
     return (
         f"🔔 *NEW BTC ROUND OPEN*\n"
-        f"{'─' * 30}\n"
-        f"⏰ {now.strftime('%H:%M:%S UTC')} | ⏱ {mins_remaining} mins left\n"
-        f"{'─' * 30}\n"
-        f"💰 *Current BTC:* ${btc_price:,.2f}\n"
-        f"🎯 *Target Price:* ${price_target:,.2f}\n"
-        f"💹 *Diff:* ${diff:+.2f} ({diff_pct:+.3f}%)\n"
-        f"{'─' * 30}\n"
+        f"{'─'*30}\n"
+        f"⏰ {now.strftime('%H:%M:%S UTC')} | ⏱ {mins_remaining} mins\n"
+        f"{'─'*30}\n"
+        f"💰 BTC Now  : ${btc:,.2f}\n"
+        f"🎯 Target   : ${target:,.2f}\n"
+        f"💹 Gap      : ${diff:+.2f} ({diff_pct:+.3f}%)\n"
+        f"{'─'*30}\n"
         + last_block +
-        f"{'─' * 30}\n"
+        f"{'─'*30}\n"
         f"⏳ Signal in ~{SIGNAL_DELAY_MINS} mins..."
     )
 
-def format_signal_message(result, now):
-    """Message 2 — fires 5 mins into round."""
+def msg_signal(result, now):
+    """Fires 5 mins into round."""
     return (
         f"🤖 *SIGNAL — {now.strftime('%H:%M UTC')}*\n"
-        f"{'─' * 30}\n"
-        f"💰 *BTC:* ${result['current_price']:,.2f}\n"
-        f"🎯 *Target:* ${result['price_target']:,.2f}\n"
-        f"💹 *Diff:* ${result['price_diff']:+.2f} ({result['price_diff_pct']:+.3f}%)\n"
-        f"⏱ *Time Left:* {result['mins_remaining']} mins\n"
-        f"{'─' * 30}\n"
-        f"🔔 *Signal:* {result['signal']}\n"
-        f"📈 *Direction:* {result['direction']}\n"
-        f"⚡ *Conviction:* {result['conviction']}\n"
-        f"🎯 *Confidence:* {result['confidence']:.1%}\n"
-        f"📉 *Edge:* {result['edge']:.1%}\n"
-        f"{'─' * 30}\n"
-        f"💡 *Reasons:*\n"
-        + "\n".join([f"  • {x}" for x in result['reason'].split(' | ')])
+        f"{'─'*30}\n"
+        f"💰 BTC    : ${result['btc_price']:,.2f}\n"
+        f"🎯 Target : ${result['round_start_price']:,.2f}\n"
+        f"💹 Gap    : ${result['price_diff']:+.2f} ({result['price_diff_pct']:+.3f}%)\n"
+        f"⏱ Left   : {result['mins_remaining']} mins\n"
+        f"{'─'*30}\n"
+        f"🔔 *{result['signal']}*\n"
+        f"📈 Direction  : {result['direction']}\n"
+        f"⚡ Conviction : {result['conviction']} ({result['confidence']:.1%})\n"
+        f"📉 Edge       : {result['edge']:.1%}\n"
+        f"{'─'*30}\n"
+        f"💡 *Why:*\n"
+        + "\n".join([f"  • {x}" for x in result["reason"].split(" | ")])
     )
 
-def format_report_message():
-    win_rate = f"{stats['correct']/stats['total']*100:.1f}%" if stats['total'] > 0 else "N/A"
-    hc_rate  = (f"{stats['high_conv_correct']/stats['high_conv_total']*100:.1f}%"
-                if stats['high_conv_total'] > 0 else "N/A")
+def msg_report():
+    wr   = f"{stats['correct']/stats['total']*100:.1f}%" if stats["total"] > 0 else "N/A"
+    hcwr = (f"{stats['high_conv_correct']/stats['high_conv_total']*100:.1f}%"
+            if stats["high_conv_total"] > 0 else "N/A")
     lines = []
     for t in trade_log[-25:]:
-        emoji = "✅" if t["correct"] else "❌"
-        conv  = "⚡" if t["high_conviction"] else "⚠️"
-        lines.append(f"{emoji}{conv} {t['time']} | {t['direction_short']} | {t['confidence']:.0%} | {'RIGHT' if t['correct'] else 'WRONG'}")
-    log_text = "\n".join(lines) if lines else "No completed trades yet"
+        e = "✅" if t["correct"] else "❌"
+        c = "⚡" if t["high_conviction"] else "⚠️"
+        lines.append(f"{e}{c} {t['time']} | {t['direction_short']} | {t['confidence']:.0%} | {'✓' if t['correct'] else '✗'}")
     return (
         f"📊 *{REPORT_INTERVAL_HOURS}H REPORT*\n"
-        f"{'─' * 30}\n"
+        f"{'─'*30}\n"
         f"📅 {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}\n"
-        f"{'─' * 30}\n"
-        f"  All rounds: {stats['total']} | ✅ {stats['correct']} | ❌ {stats['incorrect']} | {win_rate} WR\n"
-        f"  High conv:  {stats['high_conv_total']} signals | {hc_rate} WR\n"
-        f"{'─' * 30}\n"
-        f"📋 *Last 25*\n`{log_text}`"
+        f"  All: {stats['total']} rounds | {wr} WR\n"
+        f"  High conv: {stats['high_conv_total']} | {hcwr} WR\n"
+        f"{'─'*30}\n"
+        f"`{'chr(10)'.join(lines) if lines else 'No trades yet'}`"
     )
 
 def build_stats_message():
-    now      = datetime.now(timezone.utc)
-    win_rate = f"{stats['correct']/stats['total']*100:.1f}%" if stats['total'] > 0 else "N/A"
-    hc_rate  = (f"{stats['high_conv_correct']/stats['high_conv_total']*100:.1f}%"
-                if stats['high_conv_total'] > 0 else "N/A")
+    now  = datetime.now(timezone.utc)
+    wr   = f"{stats['correct']/stats['total']*100:.1f}%" if stats["total"] > 0 else "N/A"
+    hcwr = (f"{stats['high_conv_correct']/stats['high_conv_total']*100:.1f}%"
+            if stats["high_conv_total"] > 0 else "N/A")
     last_10         = trade_log[-10:]
-    last_10_correct = sum(1 for t in last_10 if t["correct"])
-    last_10_rate    = f"{last_10_correct/len(last_10)*100:.1f}%" if last_10 else "N/A"
-    one_hour_ago    = now - timedelta(hours=1)
-    last_1h         = [t for t in trade_log if datetime.fromisoformat(t["timestamp"]) > one_hour_ago]
-    last_1h_correct = sum(1 for t in last_1h if t["correct"])
-    last_1h_rate    = f"{last_1h_correct/len(last_1h)*100:.1f}%" if last_1h else "N/A"
+    l10c            = sum(1 for t in last_10 if t["correct"])
+    l10r            = f"{l10c/len(last_10)*100:.1f}%" if last_10 else "N/A"
+    one_hr_ago      = now - timedelta(hours=1)
+    last_1h         = [t for t in trade_log if datetime.fromisoformat(t["timestamp"]) > one_hr_ago]
+    l1hc            = sum(1 for t in last_1h if t["correct"])
+    l1hr            = f"{l1hc/len(last_1h)*100:.1f}%" if last_1h else "N/A"
     lines = []
     for t in last_10:
-        emoji = "✅" if t["correct"] else "❌"
-        conv  = "⚡" if t["high_conviction"] else "⚠️"
-        lines.append(f"{emoji}{conv} {t['time']} | {t['direction_short']} | {t['confidence']:.0%} | {'RIGHT' if t['correct'] else 'WRONG'}")
+        e = "✅" if t["correct"] else "❌"
+        c = "⚡" if t["high_conviction"] else "⚠️"
+        lines.append(f"{e}{c} {t['time']} | {t['direction_short']} | {t['confidence']:.0%} | {'✓' if t['correct'] else '✗'}")
     table = "\n".join(lines) if lines else "No trades yet"
     return (
         f"📊 *BOT STATS*\n"
-        f"{'─' * 30}\n"
-        f"🕐 {now.strftime('%H:%M:%S UTC')}\n"
-        f"{'─' * 30}\n"
-        f"📈 *All Time:* {stats['total']} rounds | {win_rate} WR\n"
-        f"  ✅ {stats['correct']} correct | ❌ {stats['incorrect']} wrong\n"
-        f"{'─' * 30}\n"
-        f"⏱ *Last Hour* ({len(last_1h)} rounds): {last_1h_rate} WR\n"
-        f"🔟 *Last 10:* {last_10_rate} WR\n"
-        f"{'─' * 30}\n"
-        f"`{table}`\n"
-        f"{'─' * 30}\n"
-        f"⚡ *High Conviction:* {stats['high_conv_total']} signals | {hc_rate} WR"
+        f"{'─'*30}\n"
+        f"🕐 {now.strftime('%H:%M UTC')}\n"
+        f"{'─'*30}\n"
+        f"📈 All time : {stats['total']} rounds | {wr} WR\n"
+        f"  ✅ {stats['correct']} | ❌ {stats['incorrect']}\n"
+        f"⏱ Last hour : {len(last_1h)} rounds | {l1hr} WR\n"
+        f"🔟 Last 10  : {l10r} WR\n"
+        f"⚡ High conv : {stats['high_conv_total']} | {hcwr} WR\n"
+        f"{'─'*30}\n"
+        f"`{table}`"
     )
 
 # ── Main loop ─────────────────────────────────────────────────
 def main():
-    global last_event_id, prev_event_id, pending_signal
-    global signal_fired, round_start_time, open_alert_sent
-    global last_report_time, current_market_cache, last_round
+    global current_market_cache, last_report_time
 
-    init_log_file()
-    seed_candle_window()
-
-    tg_send(
-        "🤖 *Bayse BTC Bot is live!*\n\n"
-        "Commands:\n"
-        "  /price — BTC vs target\n"
-        "  /trade — Yes/No % on Bayse\n"
-        "  /stats — performance\n\n"
-        f"Signal fires {SIGNAL_DELAY_MINS} mins into each round."
-    )
+    init_log()
+    seed_candles()
+    tg_send(start_message())
     log.info("Bot started")
 
     while True:
         try:
             handle_commands()
-            update_candle_window()
+            update_candles()
 
             now    = datetime.now(timezone.utc)
-            market = fetch_btc_bayse_market()
+            market = fetch_btc_market()
 
             if not market:
-                log.info("No BTC market — waiting...")
+                log.info("No BTC market")
                 time.sleep(30)
                 continue
 
-            # Cache market for /price and /trade commands
             current_market_cache = market
-            current_event_id     = market["event_id"]
-            btc_price            = CANDLE_WINDOW[-1]["close"] if CANDLE_WINDOW else 0
-            price_target         = parse_price_target(market.get("rules", ""))
+            event_id   = market["event_id"]
+            btc        = get_btc_price()
+            rules      = market.get("rules", "")
+            target     = parse_target(rules)
+            end_dt     = parse_end_dt(rules, now)
+            mins_left  = round((end_dt - now).total_seconds() / 60, 1) if end_dt else None
 
             # ── 12h report ────────────────────────────────────
-            hours_since = (now - last_report_time).total_seconds() / 3600
-            if hours_since >= REPORT_INTERVAL_HOURS and stats["total"] > 0:
-                tg_send(format_report_message())
+            if (now - last_report_time).total_seconds() / 3600 >= REPORT_INTERVAL_HOURS and stats["total"] > 0:
+                tg_send(msg_report())
                 last_report_time = now
 
-            # ── New round detected ────────────────────────────
-            if current_event_id != last_event_id:
-                log.info(f"New round detected: {current_event_id}")
+            # ── New round ─────────────────────────────────────
+            if event_id != current_round["event_id"]:
+                log.info(f"New round: {event_id}")
 
-                # ── Resolve previous round BEFORE sending open alert ──
-                if prev_event_id and pending_signal:
-                    log.info(f"Resolving previous round: {prev_event_id}")
-                    prev = fetch_resolved_outcome(prev_event_id)
+                # ── Resolve previous round ────────────────────
+                prev_id     = current_round["event_id"]
+                prev_signal = current_round["pending_signal"]
+                prev_target = current_round["round_start_price"]
 
-                    if prev and prev.get("resolved_outcome"):
-                        resolved     = prev["resolved_outcome"]
-                        final_price  = btc_price
-                        predicted_up = pending_signal["direction"].startswith("BUY YES")
+                if prev_id and prev_signal:
+                    resolved_data = fetch_market_by_id(prev_id)
+                    resolved      = resolved_data.get("resolved_outcome", "") if resolved_data else ""
+
+                    if resolved:
+                        final_price  = btc
+                        predicted_up = prev_signal["direction_short"] == "UP"
                         actual_up    = resolved.lower() in ["up", "yes"]
                         correct      = predicted_up == actual_up
-                        high_conv    = pending_signal["signal"] == "✅ TRADE"
+                        high_conv    = prev_signal["high_conviction"]
 
-                        # Update stats
                         stats["total"] += 1
-                        if correct:
-                            stats["correct"] += 1
-                        else:
-                            stats["incorrect"] += 1
+                        stats["correct" if correct else "incorrect"] += 1
                         if high_conv:
                             stats["high_conv_total"] += 1
                             if correct:
                                 stats["high_conv_correct"] += 1
 
-                        # Update last_round for open alert display
-                        last_round["target"]         = pending_signal.get("price_target")
-                        last_round["final_price"]    = final_price
-                        last_round["direction"]      = "UP" if actual_up else "DOWN"
-                        last_round["bot_prediction"] = "UP 📈" if predicted_up else "DOWN 📉"
-                        last_round["would_have_won"] = correct
-                        last_round["resolved"]       = True
+                        # Update prev_round for display in open alert
+                        prev_round.update({
+                            "event_id"         : prev_id,
+                            "round_start_price": prev_target,
+                            "final_price"      : final_price,
+                            "bot_direction"    : f"{'UP 📈' if predicted_up else 'DOWN 📉'}",
+                            "actual_direction" : "UP" if actual_up else "DOWN",
+                            "would_have_won"   : correct,
+                            "resolved"         : True,
+                        })
 
-                        # Log to CSV
                         entry = {
-                            "timestamp"      : now.isoformat(),
-                            "time"           : now.strftime("%H:%M"),
-                            "direction_short": "UP" if predicted_up else "DOWN",
-                            "confidence"     : pending_signal["confidence"],
-                            "correct"        : correct,
-                            "high_conviction": high_conv,
-                            "actual"         : resolved,
-                            "btc_price"      : final_price,
-                            "price_target"   : pending_signal.get("price_target"),
-                            "yes_price"      : pending_signal.get("yes_price"),
-                            "edge"           : pending_signal.get("edge"),
-                            "mins_remaining" : pending_signal.get("mins_remaining")
+                            "timestamp"        : now.isoformat(),
+                            "time"             : now.strftime("%H:%M"),
+                            "direction_short"  : prev_signal["direction_short"],
+                            "confidence"       : prev_signal["confidence"],
+                            "correct"          : correct,
+                            "high_conviction"  : high_conv,
+                            "actual"           : resolved,
+                            "btc_price"        : final_price,
+                            "round_start_price": prev_target,
+                            "price_vs_target_pct": prev_signal.get("price_diff_pct", ""),
+                            "edge"             : prev_signal.get("edge", ""),
                         }
                         trade_log.append(entry)
-                        append_to_log(entry)
-                        log.info(f"Round resolved: {'✅' if correct else '❌'} | Stats: {stats}")
+                        write_log(entry)
+                        log.info(f"Resolved: {'✅' if correct else '❌'} | {stats}")
                     else:
-                        log.warning(f"Could not resolve {prev_event_id} — no resolved_outcome yet")
+                        log.warning(f"No resolved_outcome for {prev_id}")
 
-                # Send open alert (includes last round result)
-                if price_target:
-                    tg_send(format_open_alert(market, btc_price, price_target, now))
+                # ── Reset and send open alert ─────────────────
+                current_round.update({
+                    "event_id"         : event_id,
+                    "start_time"       : now,
+                    "round_start_price": target,
+                    "signal_fired"     : False,
+                    "open_alert_sent"  : False,
+                    "pending_signal"   : None,
+                })
 
-                # Reset state
-                prev_event_id    = current_event_id
-                last_event_id    = current_event_id
-                signal_fired     = False
-                open_alert_sent  = True
-                round_start_time = now
-                pending_signal   = None
+                if target and btc and mins_left:
+                    tg_send(msg_open_alert(market, btc, target, now, mins_left))
+                    current_round["open_alert_sent"] = True
 
-            # ── Fire signal 5 mins into round ─────────────────
-            if not signal_fired and round_start_time:
-                mins_into_round = (now - round_start_time).total_seconds() / 60
-                if mins_into_round >= SIGNAL_DELAY_MINS:
-                    feat_vals, vol_regime = compute_features()
-                    if feat_vals is not None:
-                        result         = get_signal(market, feat_vals, vol_regime, now)
-                        pending_signal = result
-                        signal_fired   = True
-                        tg_send(format_signal_message(result, now))
-                        log.info(
-                            f"Signal at {mins_into_round:.1f} mins: "
-                            f"{result['signal']} | {result['direction']} | {result['confidence']:.1%}"
-                        )
+            # ── Signal after 5 mins ───────────────────────────
+            start_time = current_round["start_time"]
+            if (not current_round["signal_fired"] and
+                    start_time and
+                    current_round["round_start_price"]):
+
+                mins_in = (now - start_time).total_seconds() / 60
+                if mins_in >= SIGNAL_DELAY_MINS:
+                    result = get_signal(market, current_round["round_start_price"], now)
+                    if result:
+                        current_round["pending_signal"] = result
+                        current_round["signal_fired"]   = True
+                        tg_send(msg_signal(result, now))
+                        log.info(f"Signal: {result['signal']} {result['direction']} {result['confidence']:.1%}")
                     else:
-                        log.warning("Not enough candles for features")
+                        log.warning("Features not ready")
 
             time.sleep(30)
 
         except Exception as e:
-            log.error(f"Main loop error: {e}", exc_info=True)
+            log.error(f"Loop error: {e}", exc_info=True)
             time.sleep(60)
 
 if __name__ == "__main__":

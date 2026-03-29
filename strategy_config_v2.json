@@ -1,0 +1,11 @@
+{
+  "confidence": 0.7,
+  "fee": 0.05,
+  "min_gap_pct": 0.0002,
+  "model_file": "btc_bayse_model_v2.joblib",
+  "features_file": "features_v2.json",
+  "trained_on": "2025-09-29 to 2025-12-21",
+  "signal_window": "4-6 mins into round",
+  "backtest_wr": 0.8065,
+  "backtest_roi": 0.5728
+}
