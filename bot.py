@@ -12,9 +12,6 @@ import numpy as np
 import ta
 from datetime import datetime, timezone, timedelta
 from collections import deque
-from telegram import Bot, Update
-from telegram.constants import ParseMode
-from telegram.ext import Application, CommandHandler, ContextTypes
 
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -34,6 +31,7 @@ FEE                   = 0.05
 REPORT_INTERVAL_HOURS = 12
 SIGNAL_DELAY_MINS     = 5
 LOG_FILE              = "trade_log.csv"
+TELEGRAM_API          = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ── Startup validation ────────────────────────────────────────
 if not TELEGRAM_TOKEN:
@@ -62,6 +60,7 @@ pending_event_id   = None
 signal_fired       = False
 round_start_time   = None
 last_report_time   = datetime.now(timezone.utc)
+last_update_id     = None   # for Telegram command polling
 
 stats = {
     "total"            : 0,
@@ -73,6 +72,49 @@ stats = {
 }
 
 trade_log = []
+
+# ── Telegram HTTP helpers ─────────────────────────────────────
+def tg_send(text, chat_id=None):
+    """Send a Telegram message."""
+    try:
+        cid = chat_id or TELEGRAM_CHAT
+        r = requests.post(
+            f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": cid, "text": text, "parse_mode": "Markdown"},
+            timeout=10
+        )
+        if not r.ok:
+            log.error(f"Telegram send error: {r.text}")
+    except Exception as e:
+        log.error(f"Telegram send exception: {e}")
+
+def tg_get_updates():
+    """Poll for new Telegram messages/commands."""
+    global last_update_id
+    try:
+        params = {"timeout": 1, "allowed_updates": ["message"]}
+        if last_update_id:
+            params["offset"] = last_update_id + 1
+        r = requests.get(f"{TELEGRAM_API}/getUpdates", params=params, timeout=5)
+        if r.ok:
+            updates = r.json().get("result", [])
+            for update in updates:
+                last_update_id = update["update_id"]
+            return updates
+    except Exception as e:
+        log.error(f"Telegram poll error: {e}")
+    return []
+
+def handle_commands():
+    """Check for /stats command and reply."""
+    updates = tg_get_updates()
+    for update in updates:
+        msg = update.get("message", {})
+        text = msg.get("text", "")
+        chat_id = str(msg.get("chat", {}).get("id", ""))
+        if text.startswith("/stats"):
+            tg_send(build_stats_message(), chat_id=chat_id)
+            log.info(f"/stats requested by chat {chat_id}")
 
 # ── Trade log CSV ─────────────────────────────────────────────
 def init_log_file():
@@ -176,8 +218,6 @@ def fetch_event_by_id(event_id):
                 "event_id"        : detail["id"],
                 "resolved_outcome": m.get("resolvedOutcome", ""),
                 "status"          : m.get("status", ""),
-                "yes_price"       : m.get("outcome1Price", 0),
-                "no_price"        : m.get("outcome2Price", 0),
             }
     except Exception as e:
         log.error(f"Event fetch error: {e}")
@@ -283,7 +323,6 @@ def get_signal(market, feature_values, vol_regime):
         "price_diff"    : round(price_diff, 2),
         "price_diff_pct": round(price_diff_pct, 4),
         "mins_remaining": mins_remaining,
-        "end_time"      : end_dt.strftime("%H:%M:%S UTC") if end_dt else "unknown",
         "yes_price"     : market["yes_price"],
         "no_price"      : market["no_price"],
         "total_orders"  : market["total_orders"],
@@ -438,26 +477,35 @@ def build_stats_message():
         f"  • Signals: {stats['high_conv_total']} | Win rate: {hc_rate}"
     )
 
-# ── /stats command handler ────────────────────────────────────
-async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(build_stats_message(), parse_mode=ParseMode.MARKDOWN)
-
-# ── Signal loop ───────────────────────────────────────────────
-async def signal_loop(bot):
+# ── Main loop ─────────────────────────────────────────────────
+def main():
     global last_event_id, pending_signal, pending_event_id
     global signal_fired, round_start_time, last_report_time
 
+    init_log_file()
     seed_candle_window()
+
+    tg_send(
+        "🤖 *Bayse BTC Bot is live!*\n"
+        f"Confidence threshold: {CONFIDENCE:.0%}\n"
+        f"Signal fires {SIGNAL_DELAY_MINS} mins into each round.\n"
+        f"Reports every {REPORT_INTERVAL_HOURS} hours.\n"
+        "Type /stats anytime for performance summary."
+    )
+    log.info("Bot started")
 
     while True:
         try:
+            # Check for /stats commands
+            handle_commands()
+
             update_candle_window()
             now    = datetime.now(timezone.utc)
             market = fetch_btc_bayse_market()
 
             if not market:
                 log.info("No BTC market — waiting...")
-                await asyncio.sleep(30)
+                import time; time.sleep(30)
                 continue
 
             current_event_id = market["event_id"]
@@ -465,11 +513,7 @@ async def signal_loop(bot):
             # ── Send 12h report if due ────────────────────────
             hours_since = (now - last_report_time).total_seconds() / 3600
             if hours_since >= REPORT_INTERVAL_HOURS and stats["total"] > 0:
-                await bot.send_message(
-                    chat_id=TELEGRAM_CHAT,
-                    text=format_report_message(),
-                    parse_mode=ParseMode.MARKDOWN
-                )
+                tg_send(format_report_message())
                 last_report_time = now
                 log.info("Report sent")
 
@@ -519,12 +563,7 @@ async def signal_loop(bot):
                         trade_log.append(entry)
                         append_to_log(entry)
 
-                        result_msg = format_result_message(pending_signal, resolved, final_price)
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHAT,
-                            text=result_msg,
-                            parse_mode=ParseMode.MARKDOWN
-                        )
+                        tg_send(format_result_message(pending_signal, resolved, final_price))
                         log.info(f"Result: {'✅' if correct else '❌'} | {stats}")
                     else:
                         log.warning(f"No resolved outcome for {pending_event_id} yet")
@@ -545,12 +584,7 @@ async def signal_loop(bot):
                         signal_fired   = True
 
                         last_trade = trade_log[-1] if trade_log else None
-                        msg = format_signal_message(result, last_trade)
-                        await bot.send_message(
-                            chat_id=TELEGRAM_CHAT,
-                            text=msg,
-                            parse_mode=ParseMode.MARKDOWN
-                        )
+                        tg_send(format_signal_message(result, last_trade))
                         log.info(
                             f"Signal fired at {mins_into_round:.1f} mins: "
                             f"{result['signal']} | {result['direction']} | {result['confidence']:.1%}"
@@ -558,38 +592,11 @@ async def signal_loop(bot):
                     else:
                         log.warning("Not enough candles")
 
-            await asyncio.sleep(30)
+            import time; time.sleep(30)
 
         except Exception as e:
-            log.error(f"Signal loop error: {e}", exc_info=True)
-            await asyncio.sleep(60)
-
-# ── Main ──────────────────────────────────────────────────────
-async def main():
-    init_log_file()
-
-    app = Application.builder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("stats", handle_stats))
-
-    await app.initialize()
-    await app.start()
-    await app.updater.start_polling(drop_pending_updates=True)
-
-    bot = app.bot
-    await bot.send_message(
-        chat_id=TELEGRAM_CHAT,
-        text=(
-            "🤖 *Bayse BTC Bot is live!*\n"
-            f"Confidence threshold: {CONFIDENCE:.0%}\n"
-            f"Signal fires {SIGNAL_DELAY_MINS} mins into each round.\n"
-            f"Reports every {REPORT_INTERVAL_HOURS} hours.\n"
-            "Type /stats anytime for performance summary."
-        ),
-        parse_mode=ParseMode.MARKDOWN
-    )
-    log.info("Bot started")
-
-    await signal_loop(bot)
+            log.error(f"Main loop error: {e}", exc_info=True)
+            import time; time.sleep(60)
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
