@@ -12,8 +12,9 @@ import numpy as np
 import ta
 from datetime import datetime, timezone, timedelta
 from collections import deque
-from telegram import Bot
+from telegram import Bot, Update
 from telegram.constants import ParseMode
+from telegram.ext import ApplicationBuilder, CommandHandler, ContextTypes
 
 # ── Logging ──────────────────────────────────────────────────
 logging.basicConfig(
@@ -31,7 +32,7 @@ HEADERS               = {"X-Public-Key": BAYSE_KEY}
 CONFIDENCE            = 0.58
 FEE                   = 0.05
 REPORT_INTERVAL_HOURS = 12
-SIGNAL_DELAY_MINS     = 5    # wait 5 mins into round before firing signal
+SIGNAL_DELAY_MINS     = 5
 LOG_FILE              = "trade_log.csv"
 
 # ── Startup validation ────────────────────────────────────────
@@ -56,10 +57,10 @@ print("✅ Model loaded", flush=True)
 # ── State ─────────────────────────────────────────────────────
 CANDLE_WINDOW      = deque(maxlen=100)
 last_event_id      = None
-pending_signal     = None   # signal waiting for result
-pending_event_id   = None   # event ID of pending signal
-signal_fired       = False  # has signal been sent for current round
-round_start_time   = None   # when current round started
+pending_signal     = None
+pending_event_id   = None
+signal_fired       = False
+round_start_time   = None
 last_report_time   = datetime.now(timezone.utc)
 
 stats = {
@@ -133,7 +134,6 @@ def update_candle_window():
 
 # ── Bayse ─────────────────────────────────────────────────────
 def fetch_btc_bayse_market():
-    """Fetch current BTC 15-min market with full detail."""
     try:
         r      = requests.get(f"{BASE_URL}/pm/events", headers=HEADERS,
                               params={"limit": 50}, timeout=10)
@@ -165,7 +165,6 @@ def fetch_btc_bayse_market():
     return None
 
 def fetch_event_by_id(event_id):
-    """Fetch a specific event by ID to check resolution."""
     try:
         r      = requests.get(f"{BASE_URL}/pm/events/{event_id}",
                               headers=HEADERS, timeout=10)
@@ -232,11 +231,9 @@ def get_signal(market, feature_values, vol_regime):
     current_price = CANDLE_WINDOW[-1]["close"]
     rules         = market.get("rules", "")
 
-    # Parse price target
     price_match  = re.findall(r'\$([\d,]+\.?\d*)', rules)
     price_target = float(price_match[0].replace(",", "")) if price_match else None
 
-    # Parse end time
     end_match = re.search(r'(\d+:\d+:\d+\s?[AP]M)\s?GMT', rules)
     end_dt    = None
     if end_match:
@@ -249,7 +246,6 @@ def get_signal(market, feature_values, vol_regime):
     price_diff     = (current_price - price_target) if price_target else 0
     price_diff_pct = (price_diff / price_target * 100) if price_target else 0
 
-    # Model prediction
     feat_df = pd.DataFrame([feature_values], columns=features)
     proba   = model.predict_proba(feat_df)[0][1]
     edge    = abs(proba - market["yes_price"])
@@ -257,7 +253,6 @@ def get_signal(market, feature_values, vol_regime):
     direction  = "BUY YES (UP) 📈" if proba > 0.5 else "BUY NO (DOWN) 📉"
     conviction = "⚡ HIGH CONVICTION" if (proba > CONFIDENCE or proba < (1 - CONFIDENCE)) else "⚠️ LOW CONVICTION"
 
-    # Guards
     if vol_regime > 0.003:
         signal = "⛔ NO TRADE"
         reason = "Volatility too high — model unreliable"
@@ -266,12 +261,11 @@ def get_signal(market, feature_values, vol_regime):
         reason = f"Only {secs_remaining:.0f}s left — too late"
     elif proba > CONFIDENCE or proba < (1 - CONFIDENCE):
         signal = "✅ TRADE"
-        # ── Clean reasons — model only, no Bayse crowd ──────
         reasons = [
             f"Model confidence: {proba:.1%} {'UP' if proba > 0.5 else 'DOWN'}",
             f"RSI & momentum align with {'bullish' if proba > 0.5 else 'bearish'} signal",
             f"BTC ${price_diff:+.2f} ({price_diff_pct:+.3f}%) vs round start price",
-            f"Edge over market price: {edge:.1%}"
+            f"Edge over market: {edge:.1%}"
         ]
         reason = " | ".join(reasons)
     else:
@@ -305,7 +299,6 @@ def get_signal(market, feature_values, vol_regime):
 def format_signal_message(r, last_trade=None):
     win_rate = f"{stats['correct']/stats['total']*100:.1f}%" if stats['total'] > 0 else "N/A"
 
-    # Last round result block
     if last_trade:
         emoji     = "✅" if last_trade["correct"] else "❌"
         conv_icon = "⚡" if last_trade["high_conviction"] else "⚠️"
@@ -362,7 +355,7 @@ def format_result_message(signal_r, resolved_outcome, final_price):
         f"💰 *Final BTC:* ${final_price:,.2f}\n"
         f"🎯 *Round start was:* ${signal_r['price_target']:,.2f}\n"
         f"{'─' * 30}\n"
-        f"📊 *All signals:* {stats['total']} | ✅ {stats['correct']} | ❌ {stats['incorrect']} | {win_rate} WR\n"
+        f"📊 *All:* {stats['total']} rounds | ✅ {stats['correct']} | ❌ {stats['incorrect']} | {win_rate} WR\n"
         f"⚡ *High conviction:* {stats['high_conv_total']} signals | {hc_rate} WR"
     )
 
@@ -371,16 +364,15 @@ def format_report_message():
     hc_rate  = (f"{stats['high_conv_correct']/stats['high_conv_total']*100:.1f}%"
                 if stats['high_conv_total'] > 0 else "N/A")
 
-    log_lines = []
+    lines = []
     for t in trade_log[-25:]:
         emoji = "✅" if t["correct"] else "❌"
         conv  = "⚡" if t["high_conviction"] else "⚠️"
-        log_lines.append(
+        lines.append(
             f"{emoji}{conv} {t['time']} | {t['direction_short']} | "
             f"{t['confidence']:.0%} | {'RIGHT' if t['correct'] else 'WRONG'}"
         )
-
-    log_text = "\n".join(log_lines) if log_lines else "No completed trades yet"
+    log_text = "\n".join(lines) if lines else "No completed trades yet"
 
     return (
         f"📊 *{REPORT_INTERVAL_HOURS}H PERFORMANCE REPORT*\n"
@@ -401,26 +393,85 @@ def format_report_message():
         f"`{log_text}`"
     )
 
+# ── /stats command handler ────────────────────────────────────
+async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    now      = datetime.now(timezone.utc)
+    win_rate = f"{stats['correct']/stats['total']*100:.1f}%" if stats['total'] > 0 else "N/A"
+    hc_rate  = (f"{stats['high_conv_correct']/stats['high_conv_total']*100:.1f}%"
+                if stats['high_conv_total'] > 0 else "N/A")
+
+    # Last 10 trades
+    last_10         = trade_log[-10:] if trade_log else []
+    last_10_correct = sum(1 for t in last_10 if t["correct"])
+    last_10_rate    = f"{last_10_correct/len(last_10)*100:.1f}%" if last_10 else "N/A"
+
+    # Last 1 hour trades
+    one_hour_ago    = now - timedelta(hours=1)
+    last_1h         = [t for t in trade_log
+                       if datetime.fromisoformat(t["timestamp"]) > one_hour_ago]
+    last_1h_correct = sum(1 for t in last_1h if t["correct"])
+    last_1h_rate    = f"{last_1h_correct/len(last_1h)*100:.1f}%" if last_1h else "N/A"
+
+    # Build last 10 table
+    lines = []
+    for t in last_10:
+        emoji = "✅" if t["correct"] else "❌"
+        conv  = "⚡" if t["high_conviction"] else "⚠️"
+        lines.append(
+            f"{emoji}{conv} {t['time']} | {t['direction_short']} | "
+            f"{t['confidence']:.0%} | {'RIGHT' if t['correct'] else 'WRONG'}"
+        )
+    table = "\n".join(lines) if lines else "No trades recorded yet"
+
+    msg = (
+        f"📊 *BOT STATS*\n"
+        f"{'─' * 30}\n"
+        f"🕐 *As of:* {now.strftime('%H:%M:%S UTC')}\n"
+        f"{'─' * 30}\n"
+        f"📈 *All Time*\n"
+        f"  • Rounds: {stats['total']} | ✅ {stats['correct']} | ❌ {stats['incorrect']}\n"
+        f"  • Win rate: {win_rate}\n"
+        f"{'─' * 30}\n"
+        f"⏱ *Last 1 Hour* ({len(last_1h)} rounds)\n"
+        f"  • ✅ {last_1h_correct} correct | Win rate: {last_1h_rate}\n"
+        f"{'─' * 30}\n"
+        f"🔟 *Last 10 Rounds* | Win rate: {last_10_rate}\n"
+        f"`{table}`\n"
+        f"{'─' * 30}\n"
+        f"⚡ *High Conviction Only*\n"
+        f"  • Signals: {stats['high_conv_total']} | Win rate: {hc_rate}"
+    )
+
+    await update.message.reply_text(msg, parse_mode=ParseMode.MARKDOWN)
+
 # ── Main bot loop ─────────────────────────────────────────────
 async def run_bot():
     global last_event_id, pending_signal, pending_event_id
     global signal_fired, round_start_time, last_report_time
 
     init_log_file()
-    bot = Bot(token=TELEGRAM_TOKEN)
 
+    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+    app.add_handler(CommandHandler("stats", handle_stats))
+    await app.initialize()
+    await app.start()
+
+    bot = app.bot
     await bot.send_message(
         chat_id=TELEGRAM_CHAT,
         text=(
             "🤖 *Bayse BTC Bot is live!*\n"
             f"Confidence threshold: {CONFIDENCE:.0%}\n"
             f"Signal fires {SIGNAL_DELAY_MINS} mins into each round.\n"
-            f"Reports every {REPORT_INTERVAL_HOURS} hours."
+            f"Reports every {REPORT_INTERVAL_HOURS} hours.\n"
+            f"Type /stats anytime for performance summary."
         ),
         parse_mode=ParseMode.MARKDOWN
     )
     log.info("Bot started")
     seed_candle_window()
+
+    await app.updater.start_polling()
 
     while True:
         try:
@@ -450,10 +501,9 @@ async def run_bot():
             if current_event_id != last_event_id:
                 log.info(f"New round: {current_event_id}")
 
-                # ── Check result of previous round ────────────
-                # Fetch the PREVIOUS event by ID to get resolved outcome
+                # Check result of previous round by fetching its event ID directly
                 if pending_signal and pending_event_id:
-                    log.info(f"Checking result for previous event: {pending_event_id}")
+                    log.info(f"Checking result for: {pending_event_id}")
                     prev = fetch_event_by_id(pending_event_id)
 
                     if prev and prev.get("resolved_outcome"):
@@ -505,11 +555,10 @@ async def run_bot():
                         log.warning(f"No resolved outcome for {pending_event_id} yet")
 
                 # Reset for new round
-                last_event_id   = current_event_id
-                signal_fired    = False
+                last_event_id    = current_event_id
+                signal_fired     = False
                 round_start_time = now
-                pending_event_id = current_event_id  # track this round for result later
-                log.info(f"New round started at {now.strftime('%H:%M:%S UTC')}")
+                pending_event_id = current_event_id
 
             # ── Fire signal after SIGNAL_DELAY_MINS ──────────
             if not signal_fired and round_start_time:
@@ -517,9 +566,9 @@ async def run_bot():
                 if mins_into_round >= SIGNAL_DELAY_MINS:
                     feat_vals, vol_regime = compute_features()
                     if feat_vals is not None:
-                        result        = get_signal(market, feat_vals, vol_regime)
+                        result         = get_signal(market, feat_vals, vol_regime)
                         pending_signal = result
-                        signal_fired  = True
+                        signal_fired   = True
 
                         last_trade = trade_log[-1] if trade_log else None
                         msg = format_signal_message(result, last_trade)
@@ -528,8 +577,10 @@ async def run_bot():
                             text=msg,
                             parse_mode=ParseMode.MARKDOWN
                         )
-                        log.info(f"Signal fired at {mins_into_round:.1f} mins into round: "
-                                 f"{result['signal']} | {result['direction']} | {result['confidence']:.1%}")
+                        log.info(
+                            f"Signal fired at {mins_into_round:.1f} mins: "
+                            f"{result['signal']} | {result['direction']} | {result['confidence']:.1%}"
+                        )
                     else:
                         log.warning("Not enough candles")
 
