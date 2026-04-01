@@ -1,7 +1,7 @@
 """
-Bayse BTC Prediction Bot — v5
-==============================
-Changes from v3 (uploaded):
+Bayse BTC Prediction Bot — v5.1
+================================
+Changes from v3 (the version originally uploaded):
 
 1.  CONFIDENCE raised 0.70 → 0.80
     The 60–80% band was 41–59% WR across 189 trades — worse than random after fee.
@@ -15,33 +15,40 @@ Changes from v3 (uploaded):
     At 90% odds you need 9.5 wins to recover 1 loss — not worth it.
 
 4.  SILENT CSV LOGGING — every round logged, Telegram only on ✅ TRADE
-    All 189 rounds per session are written to CSV for analysis.
-    Only the ~40–50% that pass all filters send a Telegram notification.
-    This kills the noise and keeps data complete.
+    All rounds per session are written to CSV for analysis.
+    Only those that pass all filters send a Telegram notification.
+    CSV has a `signalled` column to distinguish the two.
 
-5.  TARGET PRICE BUG FIXED (v5.1 update)
-    Round target is now the live KuCoin BTC price at the boundary moment — NOT
-    parse_target(rules). By the time the bot polls and detects a new event_id,
-    Bayse has already published the NEXT round, so the rules string contains the
-    next round's target (one step ahead). Using btc (KuCoin close at boundary)
-    is correct: Bayse defines round N's target as BTC at its opening boundary,
-    which equals btc_at_end of round N-1. Matches exactly what the CSV shows.
+5.  BAYSE-NATIVE PRICE SOURCING (v5.1)
+    Target price:  market["start_price"] from Bayse API (their "Price Target").
+    Final price:   fetch_event_final_price(prev_event_id) — explicit Bayse API
+                   call for the previous event's finalPrice (their "Final Price").
+    KuCoin is used ONLY for ML model technical indicators (RSI, MACD, etc.),
+    never for target or resolution prices.
+    Fallback chain if Bayse fields are missing:
+      target → KuCoin btc close → parse_target(rules)
+      final  → market["final_price"] → KuCoin btc close
 
-6.  DIRECTIONAL CONFIDENCE DISPLAY FIXED
+6.  TARGET PRICE BUG FIXED
+    Old code used parse_target(rules) which was one round ahead — by the time
+    the bot detects a new event_id, Bayse already serves the next round's market.
+    Fixed by reading start_price directly from the event detail object.
+
+7.  WON/LOST DISPLAY FIXED
+    Old code: `"✅ WON" if lc["correct"] else "❌ LOST"` — None (silent round)
+    evaluated as False → showed LOST for every untraded round.
+    Fixed: explicit `is True` / `is False` / else "— no signal" checks.
+
+8.  DIRECTIONAL CONFIDENCE DISPLAY FIXED
     DOWN signal with raw_proba=0.138 now shows "86.2% DOWN" not "13.8%".
 
-7.  CIRCUIT BREAKER — pause after MAX_CONSEC_LOSSES straight losses
+9.  CIRCUIT BREAKER — pause after MAX_CONSEC_LOSSES straight losses
     Auto-clears on next win. /play also resets it.
 
-8.  TIERED STAKE GUIDE in every ✅ TRADE signal
-    Based on gap size (the strongest predictor in all data):
+10. TIERED STAKE GUIDE in every ✅ TRADE signal
     gap 0.05–0.1% → 1× base | gap 0.1–0.2% → 2× base | gap ≥0.2% → 3× base
 
-9.  Stats: removed skipped_odds, added skipped_conf + skipped_max_odds + circuit_breaks
-
-10. /play resets circuit break in addition to unpausing
-
-No timezone/hour blocking — not enough data yet to confirm consistent pattern.
+No timezone/hour blocking — needs 1 more day of data to confirm pattern.
 """
 
 import logging, requests, joblib, json, re, os, csv, sys, time, io
@@ -73,7 +80,7 @@ MIN_ORDERS        = 10
 FEE               = 0.05
 SIGNAL_DELAY_MINS = 5
 MAX_CONSEC_LOSSES = 3       # circuit breaker threshold
-REPORT_HOURS      = 6      # send auto-report every N hours
+REPORT_HOURS      = 12      # send auto-report every N hours
 LOG_FILE          = "trade_log.csv"
 
 # ─────────────────────────────────────────────────────────────
@@ -100,10 +107,12 @@ session_active = True
 session_start  = datetime.now(timezone.utc)
 session_num    = 1
 
-# Target price fix: round_start_price is set ONCE when event_id changes,
-# then frozen for the entire round. Never re-parsed mid-round.
+# round_start_price is set from Bayse start_price (or btc fallback) at
+# round detection. prev_event_id lets us fetch the previous event's
+# finalPrice from Bayse when we need to resolve it.
 current_round = {
     "event_id"         : None,
+    "prev_event_id"    : None,   # used to fetch previous round's finalPrice
     "start_time"       : None,
     "round_start_price": None,
     "signal_fired"     : False,
@@ -220,9 +229,14 @@ def handle_commands():
             hour_stats = {}
             last_completed = {k: None for k in last_completed}
             last_completed["resolved"] = False
-            current_round = {"event_id": None, "start_time": None,
-                             "round_start_price": None,
-                             "signal_fired": False, "pending_signal": None}
+            current_round = {
+                "event_id"         : None,
+                "prev_event_id"    : None,
+                "start_time"       : None,
+                "round_start_price": None,
+                "signal_fired"     : False,
+                "pending_signal"   : None,
+            }
             tg_send(
                 f"🆕 *Session {session_num} started*\n"
                 f"📅 {session_start.strftime('%Y-%m-%d %H:%M UTC')}\n"
@@ -429,6 +443,13 @@ def get_btc_price():
 # BAYSE API
 # ─────────────────────────────────────────────────────────────
 def fetch_btc_market():
+    """
+    Fetch the current active BTC 15-min prediction market from Bayse.
+
+    Extracts start_price (Bayse Price Target) and final_price (Bayse Final Price)
+    directly from the API — no KuCoin prices used for these fields.
+    KuCoin candles are used ONLY for ML model technical indicators.
+    """
     try:
         r = requests.get(
             f"{BASE_URL}/pm/events",
@@ -444,6 +465,36 @@ def fetch_btc_market():
                 ms     = detail.get("markets", [])
                 if ms:
                     m = ms[0]
+
+                    # Extract Bayse-native price fields — try all known key names
+                    def _price(obj, *keys):
+                        for k in keys:
+                            v = obj.get(k)
+                            if v is not None:
+                                try:
+                                    return float(v)
+                                except (TypeError, ValueError):
+                                    pass
+                        return None
+
+                    # Bayse Price Target (what their UI shows as "Price Target")
+                    start_price = (
+                        _price(detail, "startPrice", "start_price", "targetPrice", "target_price")
+                        or _price(m, "startPrice", "start_price", "targetPrice", "target_price")
+                        or parse_target(m.get("rules", ""))  # fallback: parse rules string
+                    )
+
+                    # Bayse Final Price (what their UI shows as "Final Price" at resolution)
+                    final_price = (
+                        _price(detail, "finalPrice", "final_price", "resolutionPrice", "resolution_price")
+                        or _price(m, "finalPrice", "final_price", "resolutionPrice", "resolution_price")
+                    )
+
+                    log.debug(
+                        f"Bayse market | event={detail['id']} | "
+                        f"start={start_price} | final={final_price}"
+                    )
+
                     return {
                         "event_id"    : detail["id"],
                         "yes_price"   : m.get("outcome1Price", 0),
@@ -452,10 +503,48 @@ def fetch_btc_market():
                         "liquidity"   : detail.get("liquidity", 0),
                         "created_at"  : detail.get("createdAt", ""),
                         "rules"       : m.get("rules", ""),
+                        "start_price" : start_price,   # Bayse Price Target
+                        "final_price" : final_price,   # Bayse Final Price (None if open)
+                        "raw_detail"  : detail,        # full response kept for debugging
                     }
     except Exception as e:
         log.error(f"fetch_btc_market: {e}")
     return None
+
+
+def fetch_event_final_price(event_id):
+    """
+    Fetch a specific (possibly already resolved) Bayse event to get its finalPrice.
+
+    Called when a new round opens to resolve the PREVIOUS round using Bayse's
+    own recorded final price — not KuCoin.
+
+    Returns finalPrice as float, or None if the event has not resolved yet
+    or the field is unavailable.
+    """
+    try:
+        r = requests.get(
+            f"{BASE_URL}/pm/events/{event_id}",
+            headers=BAYSE_HEADERS,
+            timeout=10
+        )
+        if not r.ok:
+            log.warning(f"fetch_event_final_price({event_id}): HTTP {r.status_code}")
+            return None
+        detail = r.json()
+        ms     = detail.get("markets", [])
+        m      = ms[0] if ms else {}
+        for k in ("finalPrice", "final_price", "resolutionPrice", "resolution_price"):
+            v = detail.get(k) or m.get(k)
+            if v is not None:
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    pass
+        return None
+    except Exception as e:
+        log.error(f"fetch_event_final_price({event_id}): {e}")
+        return None
 
 def parse_target(rules):
     """
@@ -957,165 +1046,179 @@ def main():
                 prev_target = current_round.get("round_start_price")
 
                 # ── RESOLVE PREVIOUS ROUND ───────────────────
-                if prev_target and btc:
-                    # BTC at new round open = closing price of previous round
-                    final_btc  = btc
-                    actual_up  = final_btc >= prev_target
-                    actual_dir = "UP" if actual_up else "DOWN"
+                if prev_target:
+                    # Determine final price — Bayse is the source of truth.
+                    # Priority:
+                    #   1. fetch_event_final_price(prev_event_id) — Bayse finalPrice
+                    #   2. market["final_price"] — sometimes in current response
+                    #   3. btc (KuCoin) — last resort fallback only
 
-                    if prev_signal:
-                        predicted_up = prev_signal["direction_short"] == "UP"
-                        correct      = predicted_up == actual_up
-                        high_conv    = prev_signal["high_conviction"]
-                        hour_h       = prev_signal.get("hour_utc", now.hour)
-                        was_signalled = (prev_signal["signal"] == "✅ TRADE")
+                    prev_eid  = current_round.get("prev_event_id")
+                    final_btc = None
 
-                        # Update stats only for signalled trades
-                        if was_signalled:
-                            stats["signalled"] += 1
-                            stats["correct" if correct else "incorrect"] += 1
-                            if high_conv:
-                                stats["high_conv_total"] += 1
-                                if correct:
-                                    stats["high_conv_correct"] += 1
-                            if hour_h not in hour_stats:
-                                hour_stats[hour_h] = {"total": 0, "correct": 0}
-                            hour_stats[hour_h]["total"] += 1
-                            if correct:
-                                hour_stats[hour_h]["correct"] += 1
+                    if prev_eid:
+                        final_btc = fetch_event_final_price(prev_eid)
+                        if final_btc:
+                            log.info(f"Resolved via Bayse finalPrice=${final_btc:,.2f} (event {prev_eid})")
+                        else:
+                            log.warning(f"Bayse finalPrice not yet available for event {prev_eid}")
 
-                            # Circuit breaker update
-                            if correct:
-                                consec_losses = 0
-                                if circuit_broken:
-                                    circuit_broken = False
-                                    tg_send("✅ *Win — circuit break cleared. Signals resuming.*")
-                            else:
-                                consec_losses += 1
-                                if consec_losses >= MAX_CONSEC_LOSSES and not circuit_broken:
-                                    circuit_broken = True
-                                    stats["circuit_breaks"] += 1
-                                    tg_send(
-                                        f"⚡ *Circuit break triggered*\n"
-                                        f"{'─'*28}\n"
-                                        f"{MAX_CONSEC_LOSSES} consecutive losses.\n"
-                                        f"Signals paused to protect bankroll.\n"
-                                        f"Use /play to resume manually."
-                                    )
+                    if not final_btc:
+                        final_btc = market.get("final_price")
+                        if final_btc:
+                            log.info(f"Resolved via market.final_price=${final_btc:,.2f}")
 
-                        last_completed.update({
-                            "round_start_price": prev_target,
-                            "btc_at_end"       : final_btc,
-                            "actual_direction" : actual_dir,
-                            "bot_direction"    : prev_signal["direction_short"],
-                            # correct is True/False only for signalled trades.
-                            # For silent rounds it stays None so alert shows "— no signal"
-                            # instead of incorrectly showing "❌ LOST".
-                            "correct"          : correct if was_signalled else None,
-                            "resolved"         : True,
-                        })
+                    if not final_btc:
+                        final_btc = btc
+                        log.warning(f"Bayse finalPrice unavailable — KuCoin fallback=${final_btc:,.2f}")
 
-                        # ── SILENT CSV WRITE (ALL rounds) ────
-                        # Every round is written regardless of signal.
-                        # `signalled` field distinguishes ✅ TRADE from silent.
-                        stats["total"] += 1
-                        entry = {
-                            "timestamp"        : now.isoformat(),
-                            "time"             : now.strftime("%H:%M"),
-                            "round_start_price": prev_target,
-                            "btc_at_signal"    : prev_signal.get("btc_price", ""),
-                            "btc_at_end"       : final_btc,
-                            "bot_direction"    : prev_signal["direction_short"],
-                            "actual_direction" : actual_dir,
-                            "correct"          : correct,
-                            "confidence"       : prev_signal["confidence"],
-                            "conviction"       : "HIGH" if prev_signal.get("high_conviction") else "LOW",
-                            "yes_price"        : prev_signal.get("yes_price", ""),
-                            "no_price"         : prev_signal.get("no_price", ""),
-                            "gap_pct"          : prev_signal.get("price_diff_pct", ""),
-                            "odds_filter_pass" : prev_signal.get("odds_filter_pass", ""),
-                            "liquidity"        : prev_signal.get("liquidity", ""),
-                            "orders"           : prev_signal.get("total_orders", ""),
-                            "session"          : session_num,
-                            "signalled"        : was_signalled,
-                            "high_conviction"  : prev_signal.get("high_conviction", False),
-                            "outcome_price"    : prev_signal.get("outcome_price", ""),
-                            "payout"           : prev_signal.get("payout", ""),
-                        }
-                        write_log(entry)
-                        if was_signalled:
-                            trade_log.append(entry)
-                        log.info(
-                            f"Closed: {'✅' if correct else '❌'} | "
-                            f"signalled={was_signalled} | "
-                            f"consec={consec_losses} | "
-                            f"sig_total={stats['signalled']}"
-                        )
-
+                    if not final_btc:
+                        log.error("No final price available — skipping resolution")
                     else:
-                        # Round had no pending signal (paused, or features unavailable)
-                        # Update last_completed so open alert shows correct result display
-                        last_completed.update({
-                            "round_start_price": prev_target,
-                            "btc_at_end"       : final_btc,
-                            "actual_direction" : actual_dir,
-                            "bot_direction"    : None,
-                            "correct"          : None,   # no trade taken
-                            "resolved"         : True,
-                        })
-                        # Still write a minimal CSV row so data is complete
-                        stats["total"] += 1
-                        write_log({
-                            "timestamp"        : now.isoformat(),
-                            "time"             : now.strftime("%H:%M"),
-                            "round_start_price": prev_target,
-                            "btc_at_signal"    : "",
-                            "btc_at_end"       : btc,
-                            "bot_direction"    : "",
-                            "actual_direction" : actual_dir,
-                            "correct"          : "",
-                            "confidence"       : "",
-                            "conviction"       : "",
-                            "yes_price"        : "",
-                            "no_price"         : "",
-                            "gap_pct"          : "",
-                            "odds_filter_pass" : "",
-                            "liquidity"        : "",
-                            "orders"           : "",
-                            "session"          : session_num,
-                            "signalled"        : False,
-                        })
+                        actual_up  = final_btc >= prev_target
+                        actual_dir = "UP" if actual_up else "DOWN"
+
+                        if prev_signal:
+                            predicted_up  = prev_signal["direction_short"] == "UP"
+                            correct       = predicted_up == actual_up
+                            high_conv     = prev_signal["high_conviction"]
+                            hour_h        = prev_signal.get("hour_utc", now.hour)
+                            was_signalled = (prev_signal["signal"] == "✅ TRADE")
+
+                            if was_signalled:
+                                stats["signalled"] += 1
+                                stats["correct" if correct else "incorrect"] += 1
+                                if high_conv:
+                                    stats["high_conv_total"] += 1
+                                    if correct:
+                                        stats["high_conv_correct"] += 1
+                                if hour_h not in hour_stats:
+                                    hour_stats[hour_h] = {"total": 0, "correct": 0}
+                                hour_stats[hour_h]["total"] += 1
+                                if correct:
+                                    hour_stats[hour_h]["correct"] += 1
+
+                                if correct:
+                                    consec_losses = 0
+                                    if circuit_broken:
+                                        circuit_broken = False
+                                        tg_send("✅ *Win — circuit break cleared. Signals resuming.*")
+                                else:
+                                    consec_losses += 1
+                                    if consec_losses >= MAX_CONSEC_LOSSES and not circuit_broken:
+                                        circuit_broken = True
+                                        stats["circuit_breaks"] += 1
+                                        tg_send(
+                                            f"⚡ *Circuit break triggered*\n"
+                                            f"{'─'*28}\n"
+                                            f"{MAX_CONSEC_LOSSES} consecutive losses.\n"
+                                            f"Signals paused to protect bankroll.\n"
+                                            f"Use /play to resume manually."
+                                        )
+
+                            last_completed.update({
+                                "round_start_price": prev_target,
+                                "btc_at_end"       : final_btc,
+                                "actual_direction" : actual_dir,
+                                "bot_direction"    : prev_signal["direction_short"],
+                                "correct"          : correct if was_signalled else None,
+                                "resolved"         : True,
+                            })
+
+                            stats["total"] += 1
+                            entry = {
+                                "timestamp"        : now.isoformat(),
+                                "time"             : now.strftime("%H:%M"),
+                                "round_start_price": prev_target,
+                                "btc_at_signal"    : prev_signal.get("btc_price", ""),
+                                "btc_at_end"       : final_btc,
+                                "bot_direction"    : prev_signal["direction_short"],
+                                "actual_direction" : actual_dir,
+                                "correct"          : correct,
+                                "confidence"       : prev_signal["confidence"],
+                                "conviction"       : "HIGH" if prev_signal.get("high_conviction") else "LOW",
+                                "yes_price"        : prev_signal.get("yes_price", ""),
+                                "no_price"         : prev_signal.get("no_price", ""),
+                                "gap_pct"          : prev_signal.get("price_diff_pct", ""),
+                                "odds_filter_pass" : prev_signal.get("odds_filter_pass", ""),
+                                "liquidity"        : prev_signal.get("liquidity", ""),
+                                "orders"           : prev_signal.get("total_orders", ""),
+                                "session"          : session_num,
+                                "signalled"        : was_signalled,
+                                "high_conviction"  : prev_signal.get("high_conviction", False),
+                                "outcome_price"    : prev_signal.get("outcome_price", ""),
+                                "payout"           : prev_signal.get("payout", ""),
+                            }
+                            write_log(entry)
+                            if was_signalled:
+                                trade_log.append(entry)
+                            log.info(
+                                f"Closed: {'✅' if correct else '❌'} | "
+                                f"signalled={was_signalled} | consec={consec_losses} | "
+                                f"sig_total={stats['signalled']}"
+                            )
+
+                        else:
+                            # No pending signal this round (paused / features unavailable)
+                            last_completed.update({
+                                "round_start_price": prev_target,
+                                "btc_at_end"       : final_btc,
+                                "actual_direction" : actual_dir,
+                                "bot_direction"    : None,
+                                "correct"          : None,
+                                "resolved"         : True,
+                            })
+                            stats["total"] += 1
+                            write_log({
+                                "timestamp"        : now.isoformat(),
+                                "time"             : now.strftime("%H:%M"),
+                                "round_start_price": prev_target,
+                                "btc_at_signal"    : "",
+                                "btc_at_end"       : final_btc,
+                                "bot_direction"    : "",
+                                "actual_direction" : actual_dir,
+                                "correct"          : "",
+                                "confidence"       : "",
+                                "conviction"       : "",
+                                "yes_price"        : "",
+                                "no_price"         : "",
+                                "gap_pct"          : "",
+                                "odds_filter_pass" : "",
+                                "liquidity"        : "",
+                                "orders"           : "",
+                                "session"          : session_num,
+                                "signalled"        : False,
+                            })
 
                 # ── SET UP NEW ROUND ─────────────────────────
-                # TARGET PRICE — use current BTC price as the round's target.
+                # TARGET PRICE — use Bayse start_price (their "Price Target")
+                # fetched directly from the API. This is what Bayse shows on
+                # their UI and what the round actually resolves against.
                 #
-                # Why NOT parse_target(rules):
-                #   Bayse publishes the next round's event before the boundary
-                #   resolves. By the time our 30s poll detects a new event_id,
-                #   the rules string already belongs to the NEXT round and its
-                #   target is one round ahead of where we are.
-                #
-                # Why BTC price at boundary IS correct:
-                #   Bayse defines round N's target as the BTC price AT the
-                #   opening boundary. That boundary price is exactly what
-                #   `btc` (from KuCoin) is right now — the first candle close
-                #   after the :00/:15/:30/:45 tick. This also matches what the
-                #   CSV shows: round_start_price == btc_at_end of previous round.
-                #
-                # parse_target() is kept for fallback only (e.g. very first round
-                # where there is no prev btc reference).
-                if btc:
+                # Fallback chain:
+                #   1. market["start_price"]  — Bayse API startPrice field
+                #   2. btc (KuCoin close)     — boundary price, close approximation
+                #   3. parse_target(rules)    — parse rules string, least reliable
+
+                new_target = market.get("start_price")
+                if new_target:
+                    log.info(f"New round target from Bayse start_price: ${new_target:,.2f}")
+                elif btc:
                     new_target = btc
-                    log.info(f"New round target set from BTC boundary price: ${new_target:,.2f}")
+                    log.warning(
+                        f"Bayse start_price not in response — using KuCoin btc "
+                        f"${new_target:,.2f} as target fallback"
+                    )
                 else:
                     new_target = parse_target(rules)
-                    log.warning(f"No BTC price available — falling back to parse_target: {new_target}")
+                    log.warning(f"All price sources failed — parse_target: {new_target}")
 
                 if not new_target:
-                    log.warning(f"Could not determine target for event {event_id}")
+                    log.error(f"Could not determine target for event {event_id}")
 
                 current_round.update({
                     "event_id"         : event_id,
+                    "prev_event_id"    : current_round.get("event_id"),  # save for final_price fetch
                     "start_time"       : now,
                     "round_start_price": new_target,
                     "signal_fired"     : False,
@@ -1124,7 +1227,7 @@ def main():
 
                 if new_target and btc and mins_left:
                     tg_send(msg_open_alert(market, btc, new_target, now, mins_left))
-                    log.info(f"Open alert | target ${new_target:,.2f} | BTC ${btc:,.2f}")
+                    log.info(f"Open alert | target=${new_target:,.2f} | BTC=${btc:,.2f}")
 
             # ── FIRE SIGNAL (5 mins into round) ──────────────
             start_time = current_round.get("start_time")
