@@ -19,9 +19,13 @@ Changes from v3 (uploaded):
     Only the ~40–50% that pass all filters send a Telegram notification.
     This kills the noise and keeps data complete.
 
-5.  TARGET PRICE BUG FIXED
-    parse_target() called once at new event_id, frozen for the round.
-    Never re-parsed mid-round — prevents target drift between rounds.
+5.  TARGET PRICE BUG FIXED (v5.1 update)
+    Round target is now the live KuCoin BTC price at the boundary moment — NOT
+    parse_target(rules). By the time the bot polls and detects a new event_id,
+    Bayse has already published the NEXT round, so the rules string contains the
+    next round's target (one step ahead). Using btc (KuCoin close at boundary)
+    is correct: Bayse defines round N's target as BTC at its opening boundary,
+    which equals btc_at_end of round N-1. Matches exactly what the CSV shows.
 
 6.  DIRECTIONAL CONFIDENCE DISPLAY FIXED
     DOWN signal with raw_proba=0.138 now shows "86.2% DOWN" not "13.8%".
@@ -691,14 +695,23 @@ def msg_open_alert(market, btc, target, now, mins_remaining):
         lc     = last_completed
         l_diff = (lc["btc_at_end"] - lc["round_start_price"]) if lc["btc_at_end"] else 0
         l_dir  = "UP 📈" if l_diff >= 0 else "DOWN 📉"
-        result = "✅ WON" if lc["correct"] else "❌ LOST"
-        wr     = f"{stats['correct']/stats['signalled']*100:.1f}%" if stats["signalled"] > 0 else "N/A"
+
+        # lc["correct"] is True/False for signalled trades, None for silent rounds
+        if lc["correct"] is True:
+            result = "✅ WON"
+        elif lc["correct"] is False:
+            result = "❌ LOST"
+        else:
+            result = "— no signal"   # silent round, no trade taken
+
+        bot_dir = lc.get("bot_direction") or "—"
+        wr      = f"{stats['correct']/stats['signalled']*100:.1f}%" if stats["signalled"] > 0 else "N/A"
         last_block = (
             f"{'─'*30}\n"
             f"📋 *Last Round*\n"
             f"  Target : ${lc['round_start_price']:,.2f}\n"
             f"  Closed : ${lc['btc_at_end']:,.2f} → {l_dir}\n"
-            f"  Bot    : {lc['bot_direction']} → {result}\n"
+            f"  Bot    : {bot_dir} → {result}\n"
             f"  Signals: {stats['signalled']} | WR {wr}\n"
         )
     else:
@@ -995,6 +1008,9 @@ def main():
                             "btc_at_end"       : final_btc,
                             "actual_direction" : actual_dir,
                             "bot_direction"    : prev_signal["direction_short"],
+                            # correct is True/False only for signalled trades.
+                            # For silent rounds it stays None so alert shows "— no signal"
+                            # instead of incorrectly showing "❌ LOST".
                             "correct"          : correct if was_signalled else None,
                             "resolved"         : True,
                         })
@@ -1037,7 +1053,16 @@ def main():
                         )
 
                     else:
-                        # Round had no pending signal (paused or features unavailable)
+                        # Round had no pending signal (paused, or features unavailable)
+                        # Update last_completed so open alert shows correct result display
+                        last_completed.update({
+                            "round_start_price": prev_target,
+                            "btc_at_end"       : final_btc,
+                            "actual_direction" : actual_dir,
+                            "bot_direction"    : None,
+                            "correct"          : None,   # no trade taken
+                            "resolved"         : True,
+                        })
                         # Still write a minimal CSV row so data is complete
                         stats["total"] += 1
                         write_log({
@@ -1062,10 +1087,32 @@ def main():
                         })
 
                 # ── SET UP NEW ROUND ─────────────────────────
-                # parse_target called ONCE here — result frozen for round
-                new_target = parse_target(rules)
+                # TARGET PRICE — use current BTC price as the round's target.
+                #
+                # Why NOT parse_target(rules):
+                #   Bayse publishes the next round's event before the boundary
+                #   resolves. By the time our 30s poll detects a new event_id,
+                #   the rules string already belongs to the NEXT round and its
+                #   target is one round ahead of where we are.
+                #
+                # Why BTC price at boundary IS correct:
+                #   Bayse defines round N's target as the BTC price AT the
+                #   opening boundary. That boundary price is exactly what
+                #   `btc` (from KuCoin) is right now — the first candle close
+                #   after the :00/:15/:30/:45 tick. This also matches what the
+                #   CSV shows: round_start_price == btc_at_end of previous round.
+                #
+                # parse_target() is kept for fallback only (e.g. very first round
+                # where there is no prev btc reference).
+                if btc:
+                    new_target = btc
+                    log.info(f"New round target set from BTC boundary price: ${new_target:,.2f}")
+                else:
+                    new_target = parse_target(rules)
+                    log.warning(f"No BTC price available — falling back to parse_target: {new_target}")
+
                 if not new_target:
-                    log.warning(f"Could not parse target: {rules[:60]}")
+                    log.warning(f"Could not determine target for event {event_id}")
 
                 current_round.update({
                     "event_id"         : event_id,
