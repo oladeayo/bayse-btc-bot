@@ -279,7 +279,11 @@ def place_order(market, direction_up, amount):
             log.error(f"markets[0] keys: {list(ms[0].keys())}")
         return None
 
-    url_path = f"/v1/pm/events/{event_id}/markets/{market_id}/orders"
+    # url_path used for HMAC signing must be the full path including /v1
+    # (matches what Bayse expects in the signature payload)
+    sign_path = f"/v1/pm/events/{event_id}/markets/{market_id}/orders"
+    # request URL: BASE_URL already contains /v1, so don't repeat it
+    req_path  = f"/pm/events/{event_id}/markets/{market_id}/orders"
 
     # Build payload — include both outcomeId (UUID) and outcome ("YES"/"NO")
     # Bayse docs show outcomeId as required, but some endpoints accept outcome string.
@@ -295,10 +299,10 @@ def place_order(market, direction_up, amount):
     if outcome_id:
         payload["outcomeId"] = outcome_id
 
-    body_str  = json.dumps(payload, separators=(",", ":"))   # compact — must match exactly what we sign
-    timestamp, signature = _build_signature(BAYSE_SECRET_KEY, "POST", url_path, body_str)
+    body_str  = json.dumps(payload, separators=(",", ":"))
+    timestamp, signature = _build_signature(BAYSE_SECRET_KEY, "POST", sign_path, body_str)
 
-    log.info(f"place_order | url={url_path} | body={body_str}")
+    log.info(f"place_order | url={sign_path} | body={body_str}")
     log.info(f"place_order | timestamp={timestamp} | sig={signature[:20]}...")
 
     try:
@@ -309,7 +313,7 @@ def place_order(market, direction_up, amount):
             "Content-Type" : "application/json",
         }
         r = requests.post(
-            f"{BASE_URL}{url_path}",
+            f"{BASE_URL}{req_path}",
             headers=headers,
             data=body_str,   # data= not json= — body must be byte-identical to what was signed
             timeout=10,
