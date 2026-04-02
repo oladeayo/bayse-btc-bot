@@ -67,6 +67,9 @@ BLOCKED_HOURS     = {9}     # add 2 when you have 4 days confirming it
 
 # ── Auto-buy / bankroll ───────────────────────────────────────
 STAKE             = 1.00    # $ per trade — flat $1
+MIN_PROFIT        = 0.30    # minimum $ profit per winning trade
+                            # at $1 stake: need payout ≥ 0.30 (outcome_price ≤ 76.9%)
+                            # i.e. winning trade must return at least $1.30 total
 STARTING_BALANCE  = 10.00   # initial deposit
 BALANCE_MIN       = 2.00    # stop auto-buy if balance drops to this
 AUTO_BUY_ENABLED  = bool(BAYSE_SECRET_KEY)  # off until BAYSE_SECRET_KEY is set
@@ -310,13 +313,25 @@ def place_order(market, direction_up, amount):
             timeout=10,
         )
         if r.ok:
-            data     = r.json()
-            order    = data.get("order", {})
-            order_id = order.get("id") or "unknown"
-            status   = order.get("status", "?")
+            data      = r.json()
+            order     = data.get("order", {})
+            order_id  = order.get("id") or "unknown"
+            status    = order.get("status", "?")
             log.info(f"Order placed ✅ | event={event_id} | outcome={outcome_id} | "
                      f"${amount:.2f} | id={order_id} | status={status}")
-            return str(order_id)
+            # Return full order dict so caller can build receipt
+            return {
+                "order_id"  : str(order_id),
+                "status"    : status,
+                "amount"    : order.get("amount", amount),
+                "price"     : order.get("price"),       # avg fill price per share
+                "quantity"  : order.get("quantity"),    # shares received
+                "currency"  : order.get("currency", "USD"),
+                "engine"    : data.get("engine", "?"),
+                "event_id"  : event_id,
+                "market_id" : market_id,
+                "outcome_id": outcome_id,
+            }
         else:
             log.error(f"Order failed: HTTP {r.status_code} | {r.text[:300]}")
             if r.status_code == 401:
@@ -844,6 +859,16 @@ def get_signal(market, round_start_price, now):
         )
         stats["skipped_max_odds"] += 1
 
+    # Minimum profit per winning trade: $1 × payout must be ≥ MIN_PROFIT ($0.30)
+    # This means outcome_price ≤ 76.9% — you get at least $1.30 back per win
+    min_payout_needed = MIN_PROFIT / STAKE
+    if payout < min_payout_needed and outcome_price <= MAX_OUTCOME_PRICE:
+        skip_reasons.append(
+            f"Payout ${STAKE * payout:.2f} < ${MIN_PROFIT:.2f} min return "
+            f"(odds {outcome_price:.0%} → need ≤{1/(1+min_payout_needed):.0%})"
+        )
+        stats["skipped_min_profit"] = stats.get("skipped_min_profit", 0) + 1
+
     if liq < MIN_LIQUIDITY:
         skip_reasons.append(f"Liq ${liq:.0f} < ${MIN_LIQUIDITY:.0f}")
         stats["skipped_liquidity"] += 1
@@ -905,6 +930,39 @@ def get_signal(market, round_start_price, now):
 # ─────────────────────────────────────────────────────────────
 # MESSAGES
 # ─────────────────────────────────────────────────────────────
+
+
+def msg_receipt(order, result, now):
+    """Clean buy receipt sent immediately after order placement."""
+    direction = "UP (YES)" if result["direction_short"] == "UP" else "DOWN (NO)"
+    price     = order.get("price")
+    qty       = order.get("quantity")
+    price_str = f"${price:.4f}/share" if price else "market fill"
+    qty_str   = f"{qty:.4f} shares" if qty else "—"
+    win_profit= round(STAKE * result["payout"], 2)
+    total_ret = round(STAKE + win_profit, 2)
+    sep = "─" * 30
+    return (
+        f"🧾 *ORDER RECEIPT*\n{sep}\n"
+        f"  Time      : {now.strftime('%H:%M:%S UTC')}\n"
+        f"  Direction : *{direction}*\n"
+        f"  Confidence: {result['conviction_label']}\n"
+        f"{sep}\n"
+        f"  Spent     : *${order.get('amount', STAKE):.2f} USD*\n"
+        f"  Fill price: {price_str}\n"
+        f"  Shares    : {qty_str}\n"
+        f"  Engine    : {order.get('engine', '?')}\n"
+        f"  Status    : {order.get('status', '?')}\n"
+        f"  Order ID  : `{order['order_id']}`\n"
+        f"{sep}\n"
+        f"  Win → +${win_profit:.2f} profit  (get back ${total_ret:.2f})\n"
+        f"  Lose → -${STAKE:.2f}\n"
+        f"  Balance   : ${balance:.2f}\n"
+        f"{sep}\n"
+        f"  Odds: {result['outcome_price']:.0%} | Payout: {result['payout']:.2f}x | EV: {result['ev']:+.3f}"
+    )
+
+
 def msg_open_alert(market, btc, target, now, mins_remaining):
     diff     = btc - target
     diff_pct = (diff / target * 100) if target else 0
@@ -967,25 +1025,21 @@ def msg_signal(result, now, order_id=None):
         if order_id:
             order_block = (
                 f"\n{'─'*30}\n"
-                f"🤖 *Auto-buy placed*\n"
-                f"  Stake    : ${STAKE:.2f}\n"
-                f"  Balance  : ${balance:.2f}\n"
-                f"  Order ID : `{order_id}`"
+                f"🤖 *Order placed* — receipt below\n"
+                f"  Stake  : ${STAKE:.2f} | Balance: ${balance:.2f}"
             )
         else:
             order_block = (
                 f"\n{'─'*30}\n"
-                f"⚠️ *Auto-buy FAILED* — placed manually if needed\n"
-                f"  Stake guide: ${STAKE:.2f} on {result['direction']}"
+                f"⚠️ *Auto-buy FAILED* — check logs\n"
+                f"  Manual: ${STAKE:.2f} on {result['direction']}"
             )
     else:
         order_block = (
             f"\n{'─'*30}\n"
             f"💡 *Stake guide*  _({result['stake_note']})_\n"
             f"  {result['stake_tier']}\n"
-            f"  $10 base → *${10 * multiplier}*  |  $20 base → *${20 * multiplier}*\n"
-            f"  Kelly: {result['kelly']:.1%} of bankroll\n"
-            f"  EV/dollar: {result['ev']:+.3f}"
+            f"  Kelly: {result['kelly']:.1%} | EV/dollar: {result['ev']:+.3f}"
         )
 
     return (
@@ -1101,7 +1155,7 @@ def build_stats_message():
         f"{'─'*30}\n"
         f"🚫 Skipped — conf:{stats['skipped_conf']} gap:{stats['skipped_gap']} "
         f"odds:{stats['skipped_max_odds']} liq:{stats['skipped_liquidity']} "
-        f"hour:{stats['skipped_hour']}\n"
+        f"hour:{stats['skipped_hour']} profit:{stats.get('skipped_min_profit',0)}\n"
         f"⚡ Circuit breaks: {stats['circuit_breaks']} | Status: {cb}\n"
         f"{'─'*30}\n"
         f"⏸ Paused: {'Yes' if bot_paused else 'No'}\n"
@@ -1413,25 +1467,28 @@ def main():
                         current_round["signal_fired"]   = True
 
                         if result["signal"] == "✅ TRADE" and not bot_paused and not circuit_broken:
-                            order_id = None
+                            order     = None   # full order dict from place_order
+                            order_id  = None
 
                             # ── AUTO-BUY ─────────────────────
                             if AUTO_BUY_ENABLED and balance >= BALANCE_MIN:
-                                market_id = get_market_id(market)
-                                if market_id:
-                                    outcome  = "YES" if result["direction_short"] == "UP" else "NO"
-                                    order_id = place_order(market_id, outcome, STAKE)
-                                    if order_id:
-                                        current_round["order_id"] = order_id
-                                        stats["orders_placed"] += 1
-                                    else:
-                                        stats["orders_failed"] += 1
-                                        log.warning("Auto-buy failed — signal sent but no order placed")
+                                direction_up = (result["direction_short"] == "UP")
+                                order        = place_order(market, direction_up, STAKE)
+                                if order:
+                                    order_id = order["order_id"]
+                                    current_round["order_id"] = order_id
+                                    stats["orders_placed"] += 1
                                 else:
-                                    log.warning("Could not extract market_id — order skipped")
                                     stats["orders_failed"] += 1
+                                    log.warning("Auto-buy failed — signal sent but no order placed")
 
+                            # Signal message first
                             tg_send(msg_signal(result, now, order_id))
+
+                            # Receipt as a separate message if order was placed
+                            if order:
+                                tg_send(msg_receipt(order, result, now))
+
                             log.info(
                                 f"Signal ✅ | {result['direction_short']} | "
                                 f"conf {result['confidence']:.1%} | "
