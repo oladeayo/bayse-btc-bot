@@ -254,50 +254,52 @@ def get_order_ids(market, direction_up):
 
 def place_order(market, direction_up, amount):
     """
-    Place a MARKET BUY order on Bayse using correct HMAC write authentication.
-
-    Requires two env vars:
-      BAYSE_KEY        — your public key  (pk_live_...)  [already set]
-      BAYSE_SECRET_KEY — your secret key  (sk_live_...)  [new — add to Railway]
-
-    How to get these if you don't have them yet:
-      1. curl -X POST https://relay.bayse.markets/v1/user/login
-            -H "Content-Type: application/json"
-            -d '{"email":"you@email.com","password":"yourpassword"}'
-         → copy token and deviceId from response
-
-      2. curl -X POST https://relay.bayse.markets/v1/user/me/api-keys
-            -H "x-auth-token: TOKEN" -H "x-device-id: DEVICEID"
-            -H "Content-Type: application/json"
-            -d '{"name":"BTC Bot"}'
-         → copy publicKey and secretKey (secret shown ONCE, store it now)
-
-      3. Set in Railway:
-            BAYSE_KEY        = pk_live_...   (public key)
-            BAYSE_SECRET_KEY = sk_live_...   (secret key)
-
-    Returns order_id string on success, None on failure.
+    Place a MARKET BUY order on Bayse using HMAC write authentication.
+    Returns full order dict on success, None on failure.
     """
     if not BAYSE_SECRET_KEY:
-        log.warning("place_order: BAYSE_SECRET_KEY not set — running notify-only. "
-                    "See docstring for how to create your API key pair.")
+        log.warning("place_order: BAYSE_SECRET_KEY not set — running notify-only.")
         return None
 
     event_id, market_id, outcome_id = get_order_ids(market, direction_up)
-    if not all([event_id, market_id, outcome_id]):
-        log.error(f"place_order: missing IDs — event={event_id} market={market_id} outcome={outcome_id}")
+    outcome_label = "YES" if direction_up else "NO"
+
+    # Log everything so we can diagnose failures from Railway logs
+    log.info(f"place_order | event={event_id} | market={market_id} | "
+             f"outcomeId={outcome_id} | direction={'UP' if direction_up else 'DOWN'} | "
+             f"outcome_label={outcome_label} | amount=${amount:.2f}")
+
+    if not event_id or not market_id:
+        log.error("place_order: missing event_id or market_id — cannot place order")
+        # Log raw_detail keys to understand the API response structure
+        detail = market.get("raw_detail", {})
+        log.error(f"raw_detail keys: {list(detail.keys())}")
+        ms = detail.get("markets", [])
+        if ms:
+            log.error(f"markets[0] keys: {list(ms[0].keys())}")
         return None
 
     url_path = f"/v1/pm/events/{event_id}/markets/{market_id}/orders"
-    payload  = {
-        "side"      : "BUY",
-        "outcomeId" : outcome_id,
-        "amount"    : round(amount, 2),
-        "type"      : "MARKET",
-        "currency"  : "USD",
+
+    # Build payload — include both outcomeId (UUID) and outcome ("YES"/"NO")
+    # Bayse docs show outcomeId as required, but some endpoints accept outcome string.
+    # We send both so whichever the API expects will match.
+    payload = {
+        "side"    : "BUY",
+        "amount"  : round(amount, 2),
+        "type"    : "MARKET",
+        "currency": "USD",
+        "outcome" : outcome_label,   # "YES" or "NO" — string fallback
     }
-    body_str  = json.dumps(payload, separators=(",", ":"))   # compact, no spaces
+    # Only add outcomeId if we actually have the UUID
+    if outcome_id:
+        payload["outcomeId"] = outcome_id
+
+    body_str  = json.dumps(payload, separators=(",", ":"))   # compact — must match exactly what we sign
     timestamp, signature = _build_signature(BAYSE_SECRET_KEY, "POST", url_path, body_str)
+
+    log.info(f"place_order | url={url_path} | body={body_str}")
+    log.info(f"place_order | timestamp={timestamp} | sig={signature[:20]}...")
 
     try:
         headers = {
@@ -309,23 +311,23 @@ def place_order(market, direction_up, amount):
         r = requests.post(
             f"{BASE_URL}{url_path}",
             headers=headers,
-            data=body_str,   # use data= not json= to keep body identical to what was signed
+            data=body_str,   # data= not json= — body must be byte-identical to what was signed
             timeout=10,
         )
+        log.info(f"place_order | response: HTTP {r.status_code} | {r.text[:400]}")
+
         if r.ok:
-            data      = r.json()
-            order     = data.get("order", {})
-            order_id  = order.get("id") or "unknown"
-            status    = order.get("status", "?")
-            log.info(f"Order placed ✅ | event={event_id} | outcome={outcome_id} | "
-                     f"${amount:.2f} | id={order_id} | status={status}")
-            # Return full order dict so caller can build receipt
+            data     = r.json()
+            order    = data.get("order", {})
+            order_id = order.get("id") or "unknown"
+            status   = order.get("status", "?")
+            log.info(f"Order placed ✅ | id={order_id} | status={status}")
             return {
                 "order_id"  : str(order_id),
                 "status"    : status,
                 "amount"    : order.get("amount", amount),
-                "price"     : order.get("price"),       # avg fill price per share
-                "quantity"  : order.get("quantity"),    # shares received
+                "price"     : order.get("price"),
+                "quantity"  : order.get("quantity"),
                 "currency"  : order.get("currency", "USD"),
                 "engine"    : data.get("engine", "?"),
                 "event_id"  : event_id,
@@ -333,15 +335,19 @@ def place_order(market, direction_up, amount):
                 "outcome_id": outcome_id,
             }
         else:
-            log.error(f"Order failed: HTTP {r.status_code} | {r.text[:300]}")
+            log.error(f"Order FAILED: HTTP {r.status_code} | body={r.text[:400]}")
             if r.status_code == 401:
-                log.error("→ Signature invalid. Check BAYSE_KEY and BAYSE_SECRET_KEY match "
-                          "the same API key pair.")
+                log.error("→ 401: Signature invalid or timestamp expired. "
+                          "Check BAYSE_KEY and BAYSE_SECRET_KEY are from the same key pair.")
             elif r.status_code == 403:
-                log.error("→ Forbidden. Your API key may not have trading permissions.")
+                log.error("→ 403: Forbidden. Key may lack trading permissions.")
+            elif r.status_code == 400:
+                log.error("→ 400: Bad request. Check payload fields match API spec.")
+            elif r.status_code == 422:
+                log.error("→ 422: Validation failed. Possible: amount too low, wrong outcomeId, or market closed.")
             return None
     except Exception as e:
-        log.error(f"place_order exception: {e}")
+        log.error(f"place_order exception: {e}", exc_info=True)
         return None
 
 # ─────────────────────────────────────────────────────────────
