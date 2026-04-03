@@ -43,7 +43,7 @@ BAYSE_HEADERS     = {"X-Public-Key": BAYSE_KEY}
 TELEGRAM_API      = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ── Strategy ──────────────────────────────────────────────────
-CONFIDENCE        = 0.80    # 60–80% band = 41–59% WR — dead zone
+CONFIDENCE        = 0.70    # 60–80% band = 41–59% WR — dead zone
 MIN_GAP_PCT       = 0.05    # below 0.05% = 47–62% WR
 MAX_OUTCOME_PRICE = 0.65    # above 65% odds → payout <0.54x, need >65% WR
                             # Session data: avg payout $0.45/win vs $1.00/loss at old 0.90 cap
@@ -69,7 +69,7 @@ BALANCE_MIN       = 2.00    # stop auto-buy if balance drops to this
 AUTO_BUY_ENABLED  = bool(BAYSE_SECRET_KEY)  # off until BAYSE_SECRET_KEY is set
 
 # ── Other ─────────────────────────────────────────────────────
-REPORT_HOURS      = 12
+REPORT_HOURS      = 6
 LOG_FILE          = "trade_log.csv"
 
 # ─────────────────────────────────────────────────────────────
