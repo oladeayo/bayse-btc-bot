@@ -51,7 +51,7 @@ BAYSE_HEADERS     = {"X-Public-Key": BAYSE_KEY}
 TELEGRAM_API      = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ── Strategy ──────────────────────────────────────────────────
-CONFIDENCE        = 0.80    # 60–80% band = 41–59% WR — dead zone
+CONFIDENCE        = 0.65    # 60–80% band = 41–59% WR — dead zone
 MIN_GAP_PCT       = 0.05    # below 0.05% = 47–62% WR
 MAX_OUTCOME_PRICE = 0.70    # tightened: op>70% = avg payout 0.155x — not worth it
                             # op<=70% = avg payout 0.63x, 1.6 wins/loss (vs 3.1 before)
@@ -64,7 +64,7 @@ MAX_CONSEC_LOSSES = 3
 # ── Hour blocking ─────────────────────────────────────────────
 # Confirmed bad across 4+ days of data (all ≤52.6% WR = below break-even):
 # 00:00=50% 02:00=43.8% 03:00=50% 04:00=43.8% 09:00=52.6% 13:00=43.8%
-BLOCKED_HOURS     = {0, 2, 3, 4, 9, 13}
+BLOCKED_HOURS     = {9} # {0, 2, 3, 4, 9, 13}
 
 # ── Auto-buy / bankroll ───────────────────────────────────────
 STAKE             = 1.00    # $ per trade — flat $1
