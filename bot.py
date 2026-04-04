@@ -1,24 +1,32 @@
 """
-Bayse BTC Prediction Bot — v7
+Bayse BTC Prediction Bot — v6
 ==============================
-NEW in v7:
-  1. LOWER OUTCOME CAP — MAX_OUTCOME_PRICE 0.90→0.65.
-     Session data: avg win=$0.45 vs avg loss=$1.00. At 0.90 cap you need
-     69% WR to profit; at 0.65 cap you only need ~52%. Much more achievable.
+Final production version. All changes backed by 295 trades across 4 days.
 
-  2. BALANCE FROM API — /balance fetches live Bayse account balance so
-     wins are properly reflected (no more stale local counter).
+NEW in v6:
+  1. AUTO-BUY — places real $1 orders on Bayse when ✅ TRADE fires.
+     Requires BAYSE_KEY (public) + BAYSE_SECRET_KEY (secret) for HMAC write auth.
+     Falls back to notification-only mode if key is missing or read-only.
 
-  3. /play_silent  — bot auto-bets the silent (filtered) prediction every
-     round at current stake until you type /pause_silent.
+  2. HOUR BLOCKING — 09:00 UTC blocked (35.7% WR across 4 days, confirmed bad).
+     02:00 UTC optionally blockable — currently watch-only.
 
-  4. /increase <N> — add $N to current stake (e.g. /increase 2 → $3)
-     /decrease <N> — subtract $N from stake (min $1)
+  3. BANKROLL TRACKING — bot tracks its own running balance, checks it before
+     every order, and refuses to over-commit. /balance command shows live state.
 
-  5. MIN_PROFIT raised to match 0.65 cap.
+  4. BALANCE-AWARE CIRCUIT BREAK — pauses if balance drops below BALANCE_MIN
+     in addition to the consecutive-loss circuit break.
 
-Carried from v6: conf≥80% | gap≥0.05% | hour blocking | circuit break |
-HMAC write auth | Bayse-native prices | silent CSV logging
+Carried from v5.1:
+  • Confidence ≥ 80%  (60–80% band = 41–59% WR)
+  • Gap ≥ 0.05%        (below = 47–62% WR)
+  • Outcome price ≤ 90% (above = payout < 0.11x, need 9+ wins per loss)
+  • Bayse-native prices (start_price / finalPrice from API, not KuCoin)
+  • Silent CSV logging (all rounds, Telegram only on ✅ TRADE)
+  • Directional confidence display  ("86.2% DOWN" not "13.8%")
+  • WON/LOST/no-signal correct display (explicit is True/is False checks)
+  • Circuit break after MAX_CONSEC_LOSSES
+  • Tiered stake guide in signal messages
 """
 
 import logging, requests, joblib, json, re, os, csv, sys, time, io
@@ -43,10 +51,10 @@ BAYSE_HEADERS     = {"X-Public-Key": BAYSE_KEY}
 TELEGRAM_API      = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 
 # ── Strategy ──────────────────────────────────────────────────
-CONFIDENCE        = 0.62    # 60–80% band = 41–59% WR — dead zone
+CONFIDENCE        = 0.80    # 60–80% band = 41–59% WR — dead zone
 MIN_GAP_PCT       = 0.05    # below 0.05% = 47–62% WR
-MAX_OUTCOME_PRICE = 0.60    # above 65% odds → payout <0.54x, need >65% WR
-                            # Session data: avg payout $0.45/win vs $1.00/loss at old 0.90 cap
+MAX_OUTCOME_PRICE = 0.70    # tightened: op>70% = avg payout 0.155x — not worth it
+                            # op<=70% = avg payout 0.63x, 1.6 wins/loss (vs 3.1 before)
 MIN_LIQUIDITY     = 50.0
 MIN_ORDERS        = 10
 FEE               = 0.05
@@ -54,22 +62,20 @@ SIGNAL_DELAY_MINS = 5
 MAX_CONSEC_LOSSES = 3
 
 # ── Hour blocking ─────────────────────────────────────────────
-# 09:00 UTC: 35.7% WR across 4 days — confirmed bad, hard block
-# 02:00 UTC: 41.7% WR across 3 days — approaching block threshold
-BLOCKED_HOURS     = {9}     # add 2 when you have 4 days confirming it
+# Confirmed bad across 4+ days of data (all ≤52.6% WR = below break-even):
+# 00:00=50% 02:00=43.8% 03:00=50% 04:00=43.8% 09:00=52.6% 13:00=43.8%
+BLOCKED_HOURS     = {0, 2, 3, 4, 9, 13}
 
 # ── Auto-buy / bankroll ───────────────────────────────────────
-DEFAULT_STAKE     = 1.00    # $ per trade — flat $1 default
-STAKE             = 1.00    # current stake (mutable via /increase /decrease)
-MIN_PROFIT        = 0.30    # minimum $ profit per winning trade
-                            # at $1 stake: need payout ≥ 0.40 (outcome_price ≤ 71.4%)
-                            # i.e. winning trade must return at least $1.40 total
+STAKE             = 1.00    # $ per trade — flat $1
+MIN_PROFIT        = 0.30    # minimum $ profit per winning trade at current stake
+                            # with op<=70% filter, min payout is ~0.32x so this is met
 STARTING_BALANCE  = 10.00   # initial deposit
 BALANCE_MIN       = 2.00    # stop auto-buy if balance drops to this
 AUTO_BUY_ENABLED  = bool(BAYSE_SECRET_KEY)  # off until BAYSE_SECRET_KEY is set
 
 # ── Other ─────────────────────────────────────────────────────
-REPORT_HOURS      = 6
+REPORT_HOURS      = 12
 LOG_FILE          = "trade_log.csv"
 
 # ─────────────────────────────────────────────────────────────
@@ -93,19 +99,24 @@ print(f"✅ Model loaded | {len(features)} features", flush=True)
 # STATE
 # ─────────────────────────────────────────────────────────────
 CANDLE_WINDOW  = deque(maxlen=100)
-bot_paused        = False
-silent_auto_buy   = False   # True while /play_silent is active
-circuit_broken    = False
+bot_paused     = False
+circuit_broken = False
 consec_losses  = 0
 session_active = True
 session_start  = datetime.now(timezone.utc)
 session_num    = 1
 
-# Running bankroll — updated on every auto-buy result
-# If auto-buy is off this tracks what WOULD have happened (paper mode)
+# Running bankroll — synced from Bayse API where possible
 balance        = STARTING_BALANCE
 total_staked   = 0.0
 total_profit   = 0.0
+
+# /play_silent — bet on silent (filtered-out) signals too
+silent_mode    = False   # True when /play_silent is active
+
+# Dynamic stake — changed by /increase and /decrease commands
+# STAKE is the config default; current_stake is the live value
+current_stake  = STAKE
 
 current_round = {
     "event_id"         : None,
@@ -353,11 +364,10 @@ def place_order(market, direction_up, amount):
 # COMMANDS
 # ─────────────────────────────────────────────────────────────
 def handle_commands():
-    global bot_paused, circuit_broken, consec_losses
+    global bot_paused, circuit_broken, consec_losses, silent_mode, current_stake
     global session_active, session_start, session_num
     global stats, trade_log, hour_stats, last_completed, current_round
     global balance, total_staked, total_profit
-    global STAKE, silent_auto_buy
 
     for update in tg_get_updates():
         msg     = update.get("message", {})
@@ -367,6 +377,48 @@ def handle_commands():
         if text.startswith("/pause"):
             bot_paused = True
             tg_send("⏸ *Bot paused.* No signals or orders will fire.\nUse /play to resume.", chat_id)
+
+        elif text.startswith("/play_silent"):
+            silent_mode = True
+            tg_send(
+                f"🔇➡️📢 *Silent mode ON*\n"
+                f"Bot will now also bet ${current_stake:.2f} on rounds that pass conf+gap "
+                f"but would normally be skipped for odds/payout.\n"
+                f"Use /pause_silent to stop.",
+                chat_id
+            )
+
+        elif text.startswith("/pause_silent"):
+            silent_mode = False
+            tg_send("🔇 *Silent mode OFF.* Only main filtered signals will trade.", chat_id)
+
+        elif text.startswith("/increase"):
+            parts = text.split()
+            if len(parts) >= 2:
+                try:
+                    add = float(parts[1])
+                    current_stake = round(current_stake + add, 2)
+                    tg_send(f"📈 *Stake increased by ${add:.2f}*\nCurrent stake: *${current_stake:.2f}*", chat_id)
+                except ValueError:
+                    tg_send("Usage: /increase 2  (adds $2 to current stake)", chat_id)
+            else:
+                tg_send(f"Current stake: ${current_stake:.2f}\nUsage: /increase 2", chat_id)
+
+        elif text.startswith("/decrease"):
+            parts = text.split()
+            if len(parts) >= 2:
+                try:
+                    sub = float(parts[1])
+                    new = round(current_stake - sub, 2)
+                    if new < 1.00:
+                        tg_send(f"❌ Can't go below $1.00 (would be ${new:.2f})", chat_id)
+                    else:
+                        current_stake = new
+                        tg_send(f"📉 *Stake decreased by ${sub:.2f}*\nCurrent stake: *${current_stake:.2f}*", chat_id)
+                except ValueError:
+                    tg_send("Usage: /decrease 1  (removes $1 from current stake)", chat_id)
+            else:
+                tg_send(f"Current stake: ${current_stake:.2f}\nUsage: /decrease 1", chat_id)
 
         elif text.startswith("/play"):
             bot_paused     = False
@@ -387,6 +439,8 @@ def handle_commands():
             balance        = STARTING_BALANCE
             total_staked   = 0.0
             total_profit   = 0.0
+            current_stake  = STAKE
+            silent_mode    = False
             stats = {k: 0 for k in stats}
             trade_log  = []
             hour_stats = {}
@@ -443,71 +497,14 @@ def handle_commands():
         elif text.startswith("/start"):
             tg_send(start_message(), chat_id)
 
-        elif text.startswith("/play_silent"):
-            silent_auto_buy = True
-            tg_send(
-                f"🔇▶️ *Silent auto-bet ON*\n"
-                f"{'─'*28}\n"
-                f"Bot will now bet *${STAKE:.2f}* on every silent round prediction\n"
-                f"(trades the raw model direction even when main filters block it).\n"
-                f"Use /pause_silent to stop.", chat_id
-            )
-
-        elif text.startswith("/pause_silent"):
-            silent_auto_buy = False
-            tg_send("🔇⏸ *Silent auto-bet OFF.* Bot back to filtered signals only.", chat_id)
-
-        elif text.startswith("/increase"):
-            parts = text.split()
-            if len(parts) >= 2:
-                try:
-                    amt = float(parts[1])
-                    if amt <= 0:
-                        tg_send("⚠️ Amount must be positive. Example: /increase 2", chat_id)
-                    else:
-                        STAKE = round(STAKE + amt, 2)
-                        tg_send(
-                            f"📈 *Stake increased*\n"
-                            f"  Added  : +${amt:.2f}\n"
-                            f"  New stake : *${STAKE:.2f}*", chat_id
-                        )
-                except ValueError:
-                    tg_send("⚠️ Invalid amount. Example: /increase 2", chat_id)
-            else:
-                tg_send(f"Current stake: *${STAKE:.2f}*\nUsage: /increase <amount>  e.g. /increase 2", chat_id)
-
-        elif text.startswith("/decrease"):
-            parts = text.split()
-            if len(parts) >= 2:
-                try:
-                    amt = float(parts[1])
-                    if amt <= 0:
-                        tg_send("⚠️ Amount must be positive. Example: /decrease 1", chat_id)
-                    elif STAKE - amt < 1.0:
-                        tg_send(f"⚠️ Stake can't go below $1.00. Current: ${STAKE:.2f}", chat_id)
-                    else:
-                        STAKE = round(STAKE - amt, 2)
-                        tg_send(
-                            f"📉 *Stake decreased*\n"
-                            f"  Removed : -${amt:.2f}\n"
-                            f"  New stake : *${STAKE:.2f}*", chat_id
-                        )
-                except ValueError:
-                    tg_send("⚠️ Invalid amount. Example: /decrease 1", chat_id)
-            else:
-                tg_send(f"Current stake: *${STAKE:.2f}*\nUsage: /decrease <amount>  e.g. /decrease 1", chat_id)
-
-        elif text.startswith("/stake"):
-            tg_send(f"💵 *Current stake:* ${STAKE:.2f}\nDefault: ${DEFAULT_STAKE:.2f}", chat_id)
-
 
 def start_message():
     mode = f"AUTO-BUY ${STAKE:.2f}/trade" if AUTO_BUY_ENABLED else "NOTIFY ONLY (set BAYSE_SECRET_KEY)"
     return (
-        f"🤖 *Bayse BTC Bot v7*\n"
+        f"🤖 *Bayse BTC Bot v6*\n"
         f"Mode: *{mode}*\n\n"
         "Commands:\n"
-        "  /balance       — live bankroll + P&L\n"
+        "  /balance       — live balance (from Bayse API)\n"
         "  /price         — BTC vs target + Bayse odds\n"
         "  /stats         — full performance summary\n"
         "  /log           — last 10 signalled trades\n"
@@ -516,11 +513,10 @@ def start_message():
         "  /export        — download full session CSV\n"
         "  /pause         — pause signals + orders\n"
         "  /play          — resume + reset circuit break\n"
-        "  /play_silent   — auto-bet every silent prediction\n"
-        "  /pause_silent  — stop silent auto-bet\n"
-        "  /increase <N>  — add $N to stake (e.g. /increase 2)\n"
-        "  /decrease <N>  — subtract $N from stake (min $1)\n"
-        "  /stake         — show current stake\n"
+        "  /play_silent   — also bet on silent signals\n"
+        "  /pause_silent  — stop betting on silent signals\n"
+        "  /increase N    — add $N to stake (e.g. /increase 2)\n"
+        "  /decrease N    — remove $N from stake\n"
         "  /start_session — new session (resets balance)\n"
         "  /stop_session  — end session + final report\n\n"
         f"v6 | conf≥{CONFIDENCE:.0%} | gap≥{MIN_GAP_PCT:.2f}% | "
@@ -530,21 +526,22 @@ def start_message():
 
 
 def build_config_message():
-    mode = f"AUTO-BUY ${STAKE:.2f} (default ${DEFAULT_STAKE:.2f})" if AUTO_BUY_ENABLED else "NOTIFY ONLY"
+    mode = f"AUTO-BUY ${STAKE:.2f}" if AUTO_BUY_ENABLED else "NOTIFY ONLY"
     cb   = (f"⚡ ACTIVE ({consec_losses}/{MAX_CONSEC_LOSSES})"
             if circuit_broken else f"✅ Clear ({consec_losses}/{MAX_CONSEC_LOSSES})")
     return (
         f"⚙️ *Bot v6 Config*\n"
         f"{'─'*30}\n"
         f"  Mode           : *{mode}*\n"
-        f"  Stake/trade    : ${STAKE:.2f}\n"
+        f"  Stake/trade    : ${current_stake:.2f} (default ${STAKE:.2f})\n"
+        f"  Silent mode    : {'ON 🔇' if silent_mode else 'OFF'}\n"
         f"  Starting bal   : ${STARTING_BALANCE:.2f}\n"
         f"  Stop threshold : ${BALANCE_MIN:.2f}\n"
         f"{'─'*30}\n"
         f"  Confidence     : ≥{CONFIDENCE:.0%}\n"
         f"  Min gap        : ≥{MIN_GAP_PCT:.2f}%\n"
         f"  Max odds       : ≤{MAX_OUTCOME_PRICE:.0%}\n"
-        f"  Blocked hours  : {sorted(BLOCKED_HOURS)} UTC\n"
+        f"  Blocked hours  : {sorted(BLOCKED_HOURS)} UTC  _(6 confirmed bad hours)_\n"
         f"  Min liquidity  : ${MIN_LIQUIDITY:.0f}\n"
         f"  Signal delay   : {SIGNAL_DELAY_MINS} mins\n"
         f"  Fee            : {FEE:.0%}\n"
@@ -559,32 +556,30 @@ def build_config_message():
 
 def cmd_balance(chat_id):
     global balance
-    mode = "AUTO-BUY" if AUTO_BUY_ENABLED else "Paper (notify only)"
-    # Try to get live balance from Bayse API
-    live_balance = fetch_bayse_balance()
-    if live_balance is not None:
-        balance = live_balance   # sync local state with real balance
-        balance_str = f"*${balance:.2f}* _(live from Bayse)_"
+    # Try to get live balance from Bayse API first
+    api_bal = fetch_balance()
+    if api_bal is not None:
+        balance = api_bal   # sync internal tracker
+        bal_src = "Bayse API"
     else:
-        balance_str = f"*${balance:.2f}* _(local estimate)_"
-    roi = f"{(balance - STARTING_BALANCE) / STARTING_BALANCE * 100:+.1f}%" if STARTING_BALANCE else "N/A"
-    wr  = f"{stats['correct']/stats['signalled']*100:.1f}%" if stats["signalled"] > 0 else "N/A"
-    silent_status = "▶️ Active" if silent_auto_buy else "⏸ Off"
+        bal_src = "internal tracker"
+    mode = "AUTO-BUY" if AUTO_BUY_ENABLED else "Paper (notify only)"
+    roi  = f"{(balance - STARTING_BALANCE) / STARTING_BALANCE * 100:+.1f}%" if STARTING_BALANCE else "N/A"
+    wr   = f"{stats['correct']/stats['signalled']*100:.1f}%" if stats["signalled"] > 0 else "N/A"
     tg_send(
         f"💰 *Balance — Session #{session_num}*\n"
         f"{'─'*28}\n"
         f"  Mode       : {mode}\n"
-        f"  Balance    : {balance_str}\n"
+        f"  Balance    : *${balance:.2f}*  _({bal_src})_\n"
         f"  Started    : ${STARTING_BALANCE:.2f}\n"
         f"  P&L        : ${balance - STARTING_BALANCE:+.2f} ({roi})\n"
         f"  Total in   : ${total_staked:.2f}\n"
         f"  Total out  : ${total_profit:.2f}\n"
         f"{'─'*28}\n"
-        f"  Stake/trade: ${STAKE:.2f}\n"
         f"  Signals    : {stats['signalled']} | WR {wr}\n"
+        f"  Stake      : ${current_stake:.2f} | Silent: {'ON' if silent_mode else 'OFF'}\n"
         f"  Orders ok  : {stats['orders_placed']}\n"
         f"  Orders fail: {stats['orders_failed']}\n"
-        f"  Silent bet : {silent_status}\n"
         f"  Stop at    : ${BALANCE_MIN:.2f}",
         chat_id,
     )
@@ -783,48 +778,38 @@ def fetch_event_final_price(event_id):
         log.error(f"fetch_event_final_price({event_id}): {e}")
         return None
 
-def fetch_bayse_balance():
-    """Fetch live account balance from Bayse API."""
-    if not BAYSE_SECRET_KEY:
-        return None
+
+
+def fetch_balance():
+    """
+    Fetch real account balance from Bayse API.
+    GET /v1/wallet/assets — returns USD balance.
+    Falls back to internal tracker if unavailable.
+    """
     try:
-        sign_path = "/v1/pm/account/balance"
-        req_path  = "/pm/account/balance"
-        body_str  = ""
-        timestamp, signature = _build_signature(BAYSE_SECRET_KEY, "GET", sign_path, body_str)
-        headers = {
-            "X-Public-Key": BAYSE_KEY,
-            "X-Timestamp":  timestamp,
-            "X-Signature":  signature,
-        }
-        r = requests.get(f"{BASE_URL}{req_path}", headers=headers, timeout=10)
+        r = requests.get(
+            f"{BASE_URL}/wallet/assets",
+            headers=BAYSE_HEADERS,
+            timeout=8,
+        )
         if r.ok:
             data = r.json()
-            # Try common field names
-            for key in ("balance", "availableBalance", "available_balance", "usdBalance", "usd_balance", "amount"):
-                val = data.get(key)
-                if val is not None:
-                    try:
-                        return float(val)
-                    except (TypeError, ValueError):
-                        pass
-            # If nested under data or account
-            nested = data.get("data") or data.get("account") or {}
-            for key in ("balance", "availableBalance", "available_balance", "usdBalance"):
-                val = nested.get(key)
-                if val is not None:
-                    try:
-                        return float(val)
-                    except (TypeError, ValueError):
-                        pass
-            log.warning(f"fetch_bayse_balance: unknown response structure: {list(data.keys())}")
-        else:
-            log.warning(f"fetch_bayse_balance: HTTP {r.status_code} | {r.text[:200]}")
+            # Try common field names for USD balance
+            assets = data if isinstance(data, list) else data.get("assets", data.get("data", []))
+            if isinstance(assets, list):
+                for a in assets:
+                    if a.get("currency","").upper() in ("USD","USDT","USDC"):
+                        v = a.get("available") or a.get("balance") or a.get("amount")
+                        if v is not None:
+                            return float(v)
+            # Sometimes it's a flat dict
+            for key in ("usd","USD","available","balance"):
+                if key in data:
+                    return float(data[key])
+        log.warning(f"fetch_balance: HTTP {r.status_code} — using internal balance")
     except Exception as e:
-        log.error(f"fetch_bayse_balance: {e}")
+        log.warning(f"fetch_balance: {e} — using internal balance")
     return None
-
-
 
 
 def parse_target(rules):
@@ -981,12 +966,11 @@ def get_signal(market, round_start_price, now):
         )
         stats["skipped_max_odds"] += 1
 
-    # Minimum profit per winning trade: $1 × payout must be ≥ MIN_PROFIT ($0.30)
-    # This means outcome_price ≤ 76.9% — you get at least $1.30 back per win
-    min_payout_needed = MIN_PROFIT / STAKE
+    # Minimum profit per winning trade using current_stake
+    min_payout_needed = MIN_PROFIT / current_stake
     if payout < min_payout_needed and outcome_price <= MAX_OUTCOME_PRICE:
         skip_reasons.append(
-            f"Payout ${STAKE * payout:.2f} < ${MIN_PROFIT:.2f} min return "
+            f"Payout ${current_stake * payout:.2f} < ${MIN_PROFIT:.2f} min return "
             f"(odds {outcome_price:.0%} → need ≤{1/(1+min_payout_needed):.0%})"
         )
         stats["skipped_min_profit"] = stats.get("skipped_min_profit", 0) + 1
@@ -1047,6 +1031,7 @@ def get_signal(market, round_start_price, now):
         "reason"           : reason,
         "timestamp"        : now.isoformat(),
         "hour_utc"         : now.hour,
+        "trade_stake"      : current_stake,
     }
 
 # ─────────────────────────────────────────────────────────────
@@ -1261,7 +1246,7 @@ def build_stats_message():
     ) if AUTO_BUY_ENABLED else ""
 
     return (
-        f"📊 *BOT STATS v7 — Session #{session_num}*\n"
+        f"📊 *BOT STATS — Session #{session_num}*\n"
         f"{'─'*30}\n"
         f"🕐 {now.strftime('%H:%M UTC')} | Since {session_start.strftime('%m-%d %H:%M UTC')}\n"
         f"Mode: {mode}\n"
@@ -1336,7 +1321,7 @@ def main():
     tg_send(start_message())
     mode = f"AUTO-BUY ${STAKE:.2f}/trade | buffer ${STARTING_BALANCE:.2f}" if AUTO_BUY_ENABLED else "NOTIFY ONLY — set BAYSE_SECRET_KEY to enable auto-buy"
     tg_send(
-        f"🟢 *Bot v7 online — Session #{session_num}*\n"
+        f"🟢 *Bot v6 online — Session #{session_num}*\n"
         f"📅 {session_start.strftime('%Y-%m-%d %H:%M UTC')}\n"
         f"Mode: *{mode}*\n\n"
         f"Active filters:\n"
@@ -1423,18 +1408,13 @@ def main():
 
                             # ── Update bankroll ───────────────
                             if was_signalled and AUTO_BUY_ENABLED and order_was_placed:
-                                earned = round(STAKE * prev_signal["payout"], 2) if correct else 0
-                                pnl_trade = round(earned - STAKE, 2)
-                                # Try to sync from Bayse live balance (so wins add up correctly)
-                                live_bal = fetch_bayse_balance()
-                                if live_bal is not None:
-                                    balance = live_bal
-                                    log.info(f"Balance synced from Bayse API: ${balance:.2f}")
-                                else:
-                                    balance = round(balance + pnl_trade, 2)
-                                    log.info(f"Bankroll (local): ${balance:.2f} | trade P&L ${pnl_trade:+.2f}")
+                                used_stake = float(prev_signal.get("trade_stake", STAKE))
+                                earned = round(used_stake * prev_signal["payout"], 2) if correct else 0
+                                pnl_trade = round(earned - used_stake, 2)
+                                balance   = round(balance + pnl_trade, 2)
                                 total_staked  += STAKE
                                 total_profit  += earned
+                                log.info(f"Bankroll: ${balance:.2f} | trade P&L ${pnl_trade:+.2f}")
                             else:
                                 earned = None
 
@@ -1594,26 +1574,44 @@ def main():
                         current_round["pending_signal"] = result
                         current_round["signal_fired"]   = True
 
-                        if result["signal"] == "✅ TRADE" and not bot_paused and not circuit_broken:
-                            order     = None   # full order dict from place_order
-                            order_id  = None
+                        is_trade    = result["signal"] == "✅ TRADE"
+                        is_silent_ok= (not is_trade and silent_mode and
+                                       result.get("confidence", 0) >= CONFIDENCE and
+                                       result.get("abs_gap_pct", 0) >= MIN_GAP_PCT)
+
+                        if (is_trade or is_silent_ok) and not bot_paused and not circuit_broken:
+                            order    = None
+                            order_id = None
+                            trade_stake = current_stake
 
                             # ── AUTO-BUY ─────────────────────
                             if AUTO_BUY_ENABLED and balance >= BALANCE_MIN:
                                 direction_up = (result["direction_short"] == "UP")
-                                order        = place_order(market, direction_up, STAKE)
+                                order        = place_order(market, direction_up, trade_stake)
                                 if order:
                                     order_id = order["order_id"]
                                     current_round["order_id"] = order_id
                                     stats["orders_placed"] += 1
+                                    # Sync balance from Bayse API after order
+                                    api_bal = fetch_balance()
+                                    if api_bal is not None:
+                                        balance = api_bal
+                                        log.info(f"Balance synced from Bayse: ${balance:.2f}")
                                 else:
                                     stats["orders_failed"] += 1
                                     log.warning("Auto-buy failed — signal sent but no order placed")
 
-                            # Signal message first
-                            tg_send(msg_signal(result, now, order_id))
+                            if is_trade:
+                                tg_send(msg_signal(result, now, order_id))
+                            else:
+                                # Silent mode trade — brief notification
+                                tg_send(
+                                    f"🔇 *Silent trade placed*\n"
+                                    f"  {result['direction']} | conf {result['confidence']:.0%} | "
+                                    f"pay {result['payout']:.2f}x | ${trade_stake:.2f}"
+                                    + (f"\n  Order: `{order_id}`" if order_id else "\n  ⚠️ Order failed")
+                                )
 
-                            # Receipt as a separate message if order was placed
                             if order:
                                 tg_send(msg_receipt(order, result, now))
 
@@ -1630,29 +1628,6 @@ def main():
                                 f"Signal ⛔ (silent) | {result['direction_short']} | "
                                 f"conf {result['confidence']:.1%} | {result['reason'][:60]}"
                             )
-                            # ── SILENT AUTO-BET ──────────────
-                            if silent_auto_buy and AUTO_BUY_ENABLED and not bot_paused and not circuit_broken and balance >= BALANCE_MIN:
-                                direction_up_s = (result["direction_short"] == "UP")
-                                silent_order   = place_order(market, direction_up_s, STAKE)
-                                if silent_order:
-                                    current_round["order_id"] = silent_order["order_id"]
-                                    stats["orders_placed"] += 1
-                                    win_profit = round(STAKE * result["payout"], 2)
-                                    tg_send(
-                                        f"🔇 *Silent Bet Placed*\n"
-                                        f"{'─'*26}\n"
-                                        f"  Direction : {result['direction']}\n"
-                                        f"  Conf      : {result['conviction_label']}\n"
-                                        f"  Stake     : ${STAKE:.2f}\n"
-                                        f"  Payout    : {result['payout']:.2f}x → +${win_profit:.2f} if win\n"
-                                        f"  Balance   : ${balance:.2f}\n"
-                                        f"  Order     : `{silent_order['order_id']}`\n"
-                                        f"  Reason skipped: _{result['reason'][:80]}_"
-                                    )
-                                    log.info(f"Silent bet placed | order={silent_order['order_id']}")
-                                else:
-                                    stats["orders_failed"] += 1
-                                    log.warning("Silent auto-bet FAILED")
                     else:
                         log.warning("Features not ready — not enough candles yet")
 
