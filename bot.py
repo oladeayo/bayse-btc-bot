@@ -51,7 +51,7 @@ log = logging.getLogger(__name__)
 DEFAULT = {
     "confidence"   : 0.70,    # model confidence threshold
     "min_gap"      : 0.05,    # % BTC must have moved from Bayse target
-    "min_payout"   : 0.0,     # 0 = disabled. e.g. 0.30 = need ≥$1.30 return
+    "min_payout"   : 0.3,     # 0 = disabled. e.g. 0.30 = need ≥$1.30 return
     "blocked_hours": [],      # e.g. [9, 2, 13] — hours UTC to skip
     "stake"        : 1.00,    # $ per trade
     "max_losses"   : 3,       # circuit break after N straight losses
