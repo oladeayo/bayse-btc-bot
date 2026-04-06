@@ -1,22 +1,18 @@
 """
-Bayse BTC Bot — v9
+Bayse BTC Bot — v10
 ===================
-Key improvements:
-  • Session config wizard — /startsession asks you to set confidence, gap,
-    min payout, blocked hours, stake interactively. Each session can have
-    different settings.
+Fixes vs v9:
+  • Bayse target price: robustly fetched from event detail, with full
+    debug logging so you can see exactly what fields come back.
+  • Session auto-starts on boot with DEFAULT config — no wizard needed.
+  • /startsession still triggers the wizard to configure a *new* session
+    mid-run, replacing the current one.
   • /default resets session config to global defaults mid-session.
   • /config shows current session vs default settings side by side.
-  • Target price always from Bayse API (startPrice field). Gap = KuCoin BTC
-    vs Bayse target (KuCoin for live price because Bayse has no live price).
-  • Every round sends signal to Telegram whether trading or not.
-  • Confidence default lowered to 70%.
-  • Min payout filter is optional (disabled by default, session can enable).
-  • Hour blocking is optional (disabled by default, session can enable).
 
 Commands:
   /start        — welcome + command list
-  /startsession — begin wizard to configure new session
+  /startsession — wizard to reconfigure + restart session
   /stopsession  — end session + final report
   /default      — reset session config to defaults
   /config       — show current session config vs defaults
@@ -46,15 +42,14 @@ log = logging.getLogger(__name__)
 
 # ─────────────────────────────────────────────────────────────
 # GLOBAL DEFAULTS — never changed at runtime
-# (Edit these in Railway env or here for permanent changes)
 # ─────────────────────────────────────────────────────────────
 DEFAULT = {
-    "confidence"   : 0.70,    # model confidence threshold
-    "min_gap"      : 0.05,    # % BTC must have moved from Bayse target
-    "min_payout"   : 0.3,     # 0 = disabled. e.g. 0.30 = need ≥$1.30 return
-    "blocked_hours": [],      # e.g. [9, 2, 13] — hours UTC to skip
-    "stake"        : 1.00,    # $ per trade
-    "max_losses"   : 3,       # circuit break after N straight losses
+    "confidence"   : 0.73,
+    "min_gap"      : 0.05,
+    "min_payout"   : 0.3,
+    "blocked_hours": [],
+    "stake"        : 1.00,
+    "max_losses"   : 3,
 }
 
 TELEGRAM_TOKEN   = os.environ.get("TELEGRAM_TOKEN", "")
@@ -65,8 +60,8 @@ BASE_URL         = "https://relay.bayse.markets/v1"
 BAYSE_HEADERS    = {"X-Public-Key": BAYSE_KEY}
 TG_API           = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 AUTO_BUY         = bool(BAYSE_SECRET_KEY)
-SIGNAL_DELAY     = 5     # minutes into round before firing signal
-FEE              = 0.05  # Bayse fee
+SIGNAL_DELAY     = 5
+FEE              = 0.05
 LOG_FILE         = "trades.csv"
 
 if not TELEGRAM_TOKEN or not TELEGRAM_CHAT or not BAYSE_KEY:
@@ -75,12 +70,12 @@ if not TELEGRAM_TOKEN or not TELEGRAM_CHAT or not BAYSE_KEY:
 
 model    = joblib.load("btc_bayse_model_v2.joblib")
 features = json.load(open("features_v2.json"))
-print(f"✅ v9 | auto_buy={AUTO_BUY}", flush=True)
+print(f"✅ v10 | auto_buy={AUTO_BUY}", flush=True)
 
 # ─────────────────────────────────────────────────────────────
-# SESSION CONFIG — copy of DEFAULT, overridden by wizard
+# SESSION CONFIG
 # ─────────────────────────────────────────────────────────────
-cfg = DEFAULT.copy()   # current session settings
+cfg = DEFAULT.copy()
 
 # ─────────────────────────────────────────────────────────────
 # MUTABLE STATE
@@ -90,16 +85,15 @@ paused        = False
 silent_mode   = False
 circuit_off   = False
 consec_losses = 0
-session_num   = 0         # starts at 0; first /startsession makes it 1
+session_num   = 1                           # starts at 1 — auto-started on boot
 session_start = datetime.now(timezone.utc)
-session_on    = False     # off until /startsession
+session_on    = True                        # ← AUTO-START: session on immediately
 balance       = 10.00
 current_stake = DEFAULT["stake"]
 total_staked  = 0.0
 total_won     = 0.0
 last_update   = None
 
-# Wizard state — multi-step /startsession flow
 wizard_active  = False
 wizard_step    = 0
 wizard_chat    = None
@@ -158,62 +152,102 @@ def tg_poll():
 def sep(): return "─" * 30
 
 # ─────────────────────────────────────────────────────────────
-# BAYSE API
+# BAYSE TARGET PRICE — robust extraction with full debug logging
 # ─────────────────────────────────────────────────────────────
-def _tryf(obj, *keys):
-    for k in keys:
-        v = obj.get(k)
-        if v is not None:
-            try: return float(v)
-            except: pass
+def _extract_target(d: dict, market: dict) -> float | None:
+    """
+    Extract the round's BTC price target from the market rules text.
+    Bayse embeds the target as a dollar amount in the rules string,
+    e.g. "BTC must close above $94,250.00 at 03:15:00 PM GMT"
+    This matches exactly how the working signal script does it.
+    """
+    rules = market.get("rules", "") or d.get("rules", "")
+    matches = re.findall(r'\$([\d,]+\.?\d*)', rules)
+    if matches:
+        try:
+            val = float(matches[0].replace(",", ""))
+            if val > 0:
+                log.info(f"[target] parsed from rules: ${val:,.2f}  (rules: {rules[:80]})")
+                return val
+        except (TypeError, ValueError):
+            log.warning(f"[target] could not parse '{matches[0]}' from rules")
+
+    log.warning(f"[target] no $ amount found in rules: '{rules[:120]}'")
     return None
 
+
 def fetch_market():
+    """
+    Fetch the active BTC-15 min event from Bayse.
+    Returns a dict with bayse_target always set from the Bayse API
+    (never falls back to KuCoin here — caller decides what to do if None).
+    """
     try:
         r = requests.get(f"{BASE_URL}/pm/events", headers=BAYSE_HEADERS,
                          params={"limit": 50}, timeout=10)
+        r.raise_for_status()
         for ev in r.json().get("events", []):
-            if "bitcoin" in ev.get("title","").lower() and "15" in ev.get("title",""):
-                r2 = requests.get(f"{BASE_URL}/pm/events/{ev['id']}",
-                                  headers=BAYSE_HEADERS, timeout=10)
-                d  = r2.json(); ms = d.get("markets", [])
-                if not ms: continue
-                m = ms[0]
-                # Bayse target price — the definitive reference price for the round
-                bayse_target = (
-                    _tryf(d,"startPrice","start_price","targetPrice","target_price") or
-                    _tryf(m,"startPrice","start_price","targetPrice","target_price")
-                )
-                return {
-                    "event_id"   : d["id"],
-                    "yes_price"  : float(m.get("outcome1Price", 0.5)),
-                    "no_price"   : float(m.get("outcome2Price", 0.5)),
-                    "liquidity"  : float(d.get("liquidity", 0)),
-                    "orders"     : int(m.get("totalOrders", 0)),
-                    "rules"      : m.get("rules", ""),
-                    "bayse_target": bayse_target,   # ← Bayse Price Target
-                    "outcome1Id" : m.get("outcome1Id"),
-                    "outcome2Id" : m.get("outcome2Id"),
-                    "market_id"  : m.get("id"),
-                    "raw"        : d,
-                }
+            title = ev.get("title", "").lower()
+            if "bitcoin" not in title and "btc" not in title:
+                continue
+            if "15" not in title:
+                continue
+
+            # Fetch full event detail
+            r2 = requests.get(f"{BASE_URL}/pm/events/{ev['id']}",
+                              headers=BAYSE_HEADERS, timeout=10)
+            r2.raise_for_status()
+            d  = r2.json()
+            ms = d.get("markets", [])
+            if not ms:
+                log.warning(f"Event {ev['id']} has no markets — skipping")
+                continue
+
+            m = ms[0]
+
+            # ── Extract Bayse target price ────────────────────
+            bayse_target = _extract_target(d, m)
+
+            return {
+                "event_id"    : d["id"],
+                "yes_price"   : float(m.get("outcome1Price", 0.5)),
+                "no_price"    : float(m.get("outcome2Price", 0.5)),
+                "liquidity"   : float(d.get("liquidity", 0)),
+                "orders"      : int(m.get("totalOrders", 0)),
+                "rules"       : m.get("rules", ""),
+                "bayse_target": bayse_target,   # None if API didn't return it
+                "outcome1Id"  : m.get("outcome1Id"),
+                "outcome2Id"  : m.get("outcome2Id"),
+                "market_id"   : m.get("id"),
+                "raw"         : d,
+            }
+
     except Exception as e:
         log.error(f"fetch_market: {e}")
     return None
+
 
 def fetch_final_price(event_id):
     try:
         r = requests.get(f"{BASE_URL}/pm/events/{event_id}",
                          headers=BAYSE_HEADERS, timeout=10)
         if not r.ok: return None
-        d = r.json(); ms = d.get("markets",[]); m = ms[0] if ms else {}
-        for k in ("finalPrice","final_price","resolutionPrice","resolution_price"):
+        d = r.json(); ms = d.get("markets", []); m = ms[0] if ms else {}
+        for k in ("finalPrice", "final_price", "resolutionPrice",
+                  "resolution_price", "closingPrice", "closing_price"):
             v = d.get(k) or m.get(k)
             if v is not None:
-                try: return float(v)
+                try:
+                    val = float(v)
+                    log.info(f"[final] {k} = {val}")
+                    return val
                 except: pass
-    except: pass
+        log.warning(f"[final] no final price for event {event_id}. "
+                    f"Event keys: {list(d.keys())}")
+    except Exception as e:
+        log.error(f"fetch_final_price: {e}")
     return None
+
 
 def fetch_balance_api():
     try:
@@ -224,13 +258,14 @@ def fetch_balance_api():
             assets = d if isinstance(d, list) else d.get("assets", d.get("data", []))
             if isinstance(assets, list):
                 for a in assets:
-                    if a.get("currency","").upper() in ("USD","USDT","USDC"):
+                    if a.get("currency", "").upper() in ("USD", "USDT", "USDC"):
                         v = a.get("available") or a.get("balance") or a.get("amount")
                         if v is not None: return float(v)
-            for k in ("usd","USD","available","balance"): 
+            for k in ("usd", "USD", "available", "balance"):
                 if k in d: return float(d[k])
     except: pass
     return None
+
 
 def parse_end_dt(rules, now):
     m = re.search(r'(\d+:\d+:\d+\s?[AP]M)\s?GMT', rules)
@@ -245,17 +280,17 @@ def parse_end_dt(rules, now):
     return None
 
 # ─────────────────────────────────────────────────────────────
-# KUCOIN — live BTC price only (for gap calculation vs Bayse target)
+# KUCOIN — live BTC price for gap calculation vs Bayse target
 # ─────────────────────────────────────────────────────────────
 def seed_candles():
     try:
         r = requests.get("https://api.kucoin.com/api/v1/market/candles",
-                         params={"symbol":"BTC-USDT","type":"1min"}, timeout=10)
-        for c in reversed(r.json().get("data",[])):
+                         params={"symbol": "BTC-USDT", "type": "1min"}, timeout=10)
+        for c in reversed(r.json().get("data", [])):
             CANDLES.append({
-                "open_time": pd.Timestamp(int(c[0]),unit="s",tz="UTC"),
+                "open_time": pd.Timestamp(int(c[0]), unit="s", tz="UTC"),
                 "open": float(c[1]), "close": float(c[2]),
-                "high": float(c[3]), "low":   float(c[4]), "volume": float(c[5]),
+                "high": float(c[3]), "low": float(c[4]), "volume": float(c[5]),
             })
         log.info(f"Seeded {len(CANDLES)} candles | ${CANDLES[-1]['close']:,.2f}")
     except Exception as e: log.error(f"seed_candles: {e}")
@@ -263,19 +298,20 @@ def seed_candles():
 def update_candles():
     try:
         r = requests.get("https://api.kucoin.com/api/v1/market/candles",
-                         params={"symbol":"BTC-USDT","type":"1min","pageSize":3}, timeout=5)
-        data = r.json().get("data",[])
+                         params={"symbol": "BTC-USDT", "type": "1min", "pageSize": 3}, timeout=5)
+        data = r.json().get("data", [])
         if not data: return
         c = data[0]
-        latest = {"open_time":pd.Timestamp(int(c[0]),unit="s",tz="UTC"),
-                  "open":float(c[1]),"close":float(c[2]),
-                  "high":float(c[3]),"low":float(c[4]),"volume":float(c[5])}
+        latest = {
+            "open_time": pd.Timestamp(int(c[0]), unit="s", tz="UTC"),
+            "open": float(c[1]), "close": float(c[2]),
+            "high": float(c[3]), "low": float(c[4]), "volume": float(c[5]),
+        }
         if not CANDLES or latest["open_time"] > CANDLES[-1]["open_time"]:
             CANDLES.append(latest)
     except: pass
 
 def btc_live():
-    """Live BTC price from KuCoin — used for gap vs Bayse target and ML features."""
     return CANDLES[-1]["close"] if CANDLES else None
 
 # ─────────────────────────────────────────────────────────────
@@ -285,42 +321,42 @@ def compute_features(target):
     if len(CANDLES) < 60 or not target: return None
     df = pd.DataFrame(list(CANDLES)).sort_values("open_time").reset_index(drop=True)
     try:
-        df["rsi_14"]      = ta.momentum.RSIIndicator(df["close"],14).rsi()
-        df["rsi_7"]       = ta.momentum.RSIIndicator(df["close"],7).rsi()
-        df["rsi_21"]      = ta.momentum.RSIIndicator(df["close"],21).rsi()
-        df["stoch"]       = ta.momentum.StochasticOscillator(df["high"],df["low"],df["close"]).stoch()
-        df["macd"]        = ta.trend.MACD(df["close"]).macd_diff()
-        df["macd_signal"] = ta.trend.MACD(df["close"]).macd_signal()
-        df["ema_9"]       = ta.trend.EMAIndicator(df["close"],9).ema_indicator()
-        df["ema_21"]      = ta.trend.EMAIndicator(df["close"],21).ema_indicator()
-        df["ema_cross"]   = df["ema_9"] - df["ema_21"]
+        df["rsi_14"]         = ta.momentum.RSIIndicator(df["close"], 14).rsi()
+        df["rsi_7"]          = ta.momentum.RSIIndicator(df["close"], 7).rsi()
+        df["rsi_21"]         = ta.momentum.RSIIndicator(df["close"], 21).rsi()
+        df["stoch"]          = ta.momentum.StochasticOscillator(df["high"], df["low"], df["close"]).stoch()
+        df["macd"]           = ta.trend.MACD(df["close"]).macd_diff()
+        df["macd_signal"]    = ta.trend.MACD(df["close"]).macd_signal()
+        df["ema_9"]          = ta.trend.EMAIndicator(df["close"], 9).ema_indicator()
+        df["ema_21"]         = ta.trend.EMAIndicator(df["close"], 21).ema_indicator()
+        df["ema_cross"]      = df["ema_9"] - df["ema_21"]
         bb = ta.volatility.BollingerBands(df["close"])
-        df["bb_position"] = (df["close"]-bb.bollinger_mavg())/bb.bollinger_wband()
-        df["bb_width"]    = bb.bollinger_wband()
-        df["atr"]         = ta.volatility.AverageTrueRange(
-                                df["high"],df["low"],df["close"],14).average_true_range()
-        df["vol_ratio_15"]= df["volume"]/df["volume"].rolling(15).mean()
-        df["vol_ratio_60"]= df["volume"]/df["volume"].rolling(60).mean()
-        df["obv"]         = ta.volume.OnBalanceVolumeIndicator(
-                                df["close"],df["volume"]).on_balance_volume()
-        df["obv_slope"]   = df["obv"].diff(5)
-        df["candle_body"] = (df["close"]-df["open"])/df["open"]
-        df["momentum_1"]  = df["close"].pct_change(1)
-        df["momentum_3"]  = df["close"].pct_change(3)
-        df["momentum_5"]  = df["close"].pct_change(5)
+        df["bb_position"]    = (df["close"] - bb.bollinger_mavg()) / bb.bollinger_wband()
+        df["bb_width"]       = bb.bollinger_wband()
+        df["atr"]            = ta.volatility.AverageTrueRange(
+                                   df["high"], df["low"], df["close"], 14).average_true_range()
+        df["vol_ratio_15"]   = df["volume"] / df["volume"].rolling(15).mean()
+        df["vol_ratio_60"]   = df["volume"] / df["volume"].rolling(60).mean()
+        df["obv"]            = ta.volume.OnBalanceVolumeIndicator(
+                                   df["close"], df["volume"]).on_balance_volume()
+        df["obv_slope"]      = df["obv"].diff(5)
+        df["candle_body"]    = (df["close"] - df["open"]) / df["open"]
+        df["momentum_1"]     = df["close"].pct_change(1)
+        df["momentum_3"]     = df["close"].pct_change(3)
+        df["momentum_5"]     = df["close"].pct_change(5)
         df["rolling_std_15"] = df["close"].pct_change().rolling(15).std()
         df["rolling_std_60"] = df["close"].pct_change().rolling(60).std()
-        df["hour"]        = df["open_time"].dt.hour
-        df["dayofweek"]   = df["open_time"].dt.dayofweek
+        df["hour"]           = df["open_time"].dt.hour
+        df["dayofweek"]      = df["open_time"].dt.dayofweek
         latest = df.iloc[-1].copy()
-        atr = max(float(latest["atr"]),1e-8)
-        pvt = (latest["close"]-target)/target
+        atr = max(float(latest["atr"]), 1e-8)
+        pvt = (latest["close"] - target) / target
         latest["price_vs_target"] = pvt
-        latest["price_gap_usd"]   = latest["close"]-target
-        latest["gap_vs_atr"]      = (latest["close"]-target)/atr
+        latest["price_gap_usd"]   = latest["close"] - target
+        latest["gap_vs_atr"]      = (latest["close"] - target) / atr
         latest["gap_pct_abs"]     = abs(pvt)
         latest["early_momentum"]  = pvt
-        latest["rsi_vs_neutral"]  = float(latest["rsi_14"])-50
+        latest["rsi_vs_neutral"]  = float(latest["rsi_14"]) - 50
         return latest[features].values
     except Exception as e:
         log.error(f"features: {e}")
@@ -341,35 +377,35 @@ def _sign(method, path, body_str):
 
 def place_order(market, direction_up, amount):
     if not BAYSE_SECRET_KEY: return None
-    event_id  = market["raw"].get("id")
-    market_id = market["market_id"]
+    event_id   = market["raw"].get("id")
+    market_id  = market["market_id"]
     outcome_id = market["outcome1Id"] if direction_up else market["outcome2Id"]
     if not event_id or not market_id:
         log.error("place_order: missing event_id or market_id"); return None
 
     sign_path = f"/v1/pm/events/{event_id}/markets/{market_id}/orders"
     req_path  = f"/pm/events/{event_id}/markets/{market_id}/orders"
-    payload   = {"side":"BUY","amount":round(amount,2),"type":"MARKET",
-                 "currency":"USD","outcome":"YES" if direction_up else "NO"}
+    payload   = {"side": "BUY", "amount": round(amount, 2), "type": "MARKET",
+                 "currency": "USD", "outcome": "YES" if direction_up else "NO"}
     if outcome_id: payload["outcomeId"] = outcome_id
 
-    body_str = json.dumps(payload, separators=(",",":"))
+    body_str = json.dumps(payload, separators=(",", ":"))
     ts, sig  = _sign("POST", sign_path, body_str)
     try:
         r = requests.post(f"{BASE_URL}{req_path}",
-            headers={"X-Public-Key":BAYSE_KEY,"X-Timestamp":ts,
-                     "X-Signature":sig,"Content-Type":"application/json"},
+            headers={"X-Public-Key": BAYSE_KEY, "X-Timestamp": ts,
+                     "X-Signature": sig, "Content-Type": "application/json"},
             data=body_str, timeout=10)
         log.info(f"order: HTTP {r.status_code} | {r.text[:200]}")
         if r.ok:
             d = r.json()
             o = d.get("order") or d.get("clobOrder") or d.get("ammOrder") or {}
-            oid = o.get("id") or d.get("id","?")
-            return {"order_id":str(oid),"status":o.get("status","?"),
-                    "amount":o.get("amount",amount),
-                    "price":o.get("price") or o.get("avgFillPrice"),
-                    "quantity":o.get("quantity") or o.get("filledSize"),
-                    "engine":d.get("engine","?")}
+            oid = o.get("id") or d.get("id", "?")
+            return {"order_id": str(oid), "status": o.get("status", "?"),
+                    "amount": o.get("amount", amount),
+                    "price": o.get("price") or o.get("avgFillPrice"),
+                    "quantity": o.get("quantity") or o.get("filledSize"),
+                    "engine": d.get("engine", "?")}
     except Exception as e:
         log.error(f"place_order: {e}")
     return None
@@ -377,18 +413,18 @@ def place_order(market, direction_up, amount):
 # ─────────────────────────────────────────────────────────────
 # CSV LOG
 # ─────────────────────────────────────────────────────────────
-FIELDS = ["timestamp","time","hour","bayse_target","btc_live","close",
-          "direction","actual","correct","conf","payout","op","gap_pct",
-          "traded","stake","order_id","session","balance_after"]
+FIELDS = ["timestamp", "time", "hour", "bayse_target", "btc_live", "close",
+          "direction", "actual", "correct", "conf", "payout", "op", "gap_pct",
+          "traded", "stake", "order_id", "session", "balance_after"]
 
 def init_log():
     if not os.path.exists(LOG_FILE):
-        with open(LOG_FILE,"w",newline="") as f:
+        with open(LOG_FILE, "w", newline="") as f:
             csv.writer(f).writerow(FIELDS)
 
 def write_log(row):
-    with open(LOG_FILE,"a",newline="") as f:
-        csv.writer(f).writerow([row.get(k,"") for k in FIELDS])
+    with open(LOG_FILE, "a", newline="") as f:
+        csv.writer(f).writerow([row.get(k, "") for k in FIELDS])
 
 # ─────────────────────────────────────────────────────────────
 # SIGNAL
@@ -408,12 +444,10 @@ def get_signal(market, bayse_target, now):
     yes_p  = market["yes_price"]
     op     = yes_p if up else (1.0 - yes_p)
     op     = max(op, 0.01)
-    payout = round((1.0/op - 1) * (1 - FEE), 3)
+    payout = round((1.0 / op - 1) * (1 - FEE), 3)
 
-    # Gap: KuCoin live price vs Bayse target
     gap_pct = (btc - bayse_target) / bayse_target * 100
 
-    # Apply session config filters
     skip = []
     if conf < cfg["confidence"]:
         skip.append(f"conf {conf:.1%} < {cfg['confidence']:.0%}")
@@ -442,8 +476,8 @@ def get_signal(market, bayse_target, now):
         "target"   : bayse_target,
         "yes_p"    : yes_p,
         "no_p"     : 1.0 - yes_p,
-        "liq"      : market.get("liquidity",0),
-        "orders"   : market.get("orders",0),
+        "liq"      : market.get("liquidity", 0),
+        "orders"   : market.get("orders", 0),
         "hour"     : now.hour,
     }
 
@@ -451,7 +485,6 @@ def get_signal(market, bayse_target, now):
 # MESSAGES
 # ─────────────────────────────────────────────────────────────
 def fmt_cfg(c):
-    """Format a config dict as a short readable string."""
     ph = f"blocked {c['blocked_hours']}" if c["blocked_hours"] else "no hour block"
     mp = f"pay≥{c['min_payout']:.2f}x" if c["min_payout"] > 0 else "no payout filter"
     return (f"conf≥{c['confidence']:.0%} | gap≥{c['min_gap']:.2f}% | "
@@ -488,13 +521,12 @@ def msg_open(market, btc, target, now, mins):
 
     return (f"🔔 *NEW ROUND — Session #{session_num}*\n{sep()}\n"
             f"⏰ {now.strftime('%H:%M:%S UTC')} | ⏱ ~{mins} mins\n{sep()}\n"
-            f"💰 BTC (KuCoin live): ${btc:,.2f}\n"
-            f"🎯 Bayse Target     : ${target:,.2f}\n"
-            f"💹 Gap              : ${diff:+.2f} ({diff_pct:+.3f}%)\n"
-            f"📊 Bayse Odds       : YES {yes:.0%} | NO {no:.0%}\n"
+            f"💰 BTC (KuCoin live) : ${btc:,.2f}\n"
+            f"🎯 Bayse Target      : ${target:,.2f}\n"
+            f"💹 Gap               : ${diff:+.2f} ({diff_pct:+.3f}%)\n"
+            f"📊 Bayse Odds        : YES {yes:.0%} | NO {no:.0%}\n"
             + last_blk + f"{sep()}\n⏳ Signal in ~{SIGNAL_DELAY} mins"
             + bal_line + status)
-
 
 def msg_signal_card(sig, traded, order_id=None, silent=False):
     win_amt   = round(current_stake * sig["payout"], 2)
@@ -535,7 +567,6 @@ def msg_signal_card(sig, traded, order_id=None, silent=False):
             f"  Conf      : {sig['conf']:.1%}  [{conv}]\n"
             + trade_blk)
 
-
 def msg_receipt(order, sig):
     win_amt   = round(current_stake * sig["payout"], 2)
     total_ret = round(current_stake + win_amt, 2)
@@ -553,76 +584,68 @@ def msg_receipt(order, sig):
             f"  Balance   : ${balance:.2f}")
 
 # ─────────────────────────────────────────────────────────────
-# SESSION WIZARD
+# SESSION WIZARD  (only triggered by /startsession)
 # ─────────────────────────────────────────────────────────────
 WIZARD_STEPS = [
     {
         "key"    : "confidence",
-        "prompt" : ("🎯 *Step 1/6 — Confidence threshold*\n"
-                    "Minimum model confidence to trade.\n\n"
+        "prompt" : (f"🎯 *Step 1/6 — Confidence threshold*\n"
                     f"Default: {DEFAULT['confidence']:.0%}\n"
-                    "Examples: 70% | 75% | 80% | 85%\n\n"
-                    "Reply with a number (e.g. `70`) or `skip` for default."),
-        "parse"  : lambda v: float(v)/100 if float(v) > 1 else float(v),
+                    f"Examples: 70 | 75 | 80 | 85\n\n"
+                    f"Reply with a number or `skip` for default."),
+        "parse"  : lambda v: float(v) / 100 if float(v) > 1 else float(v),
         "valid"  : lambda v: 0.50 <= v <= 0.99,
-        "err"    : "Must be between 50 and 99 (e.g. 70 for 70%)",
+        "err"    : "Must be between 50 and 99 (e.g. 70)",
     },
     {
         "key"    : "min_gap",
-        "prompt" : ("📏 *Step 2/6 — Minimum gap %*\n"
-                    "BTC must have moved at least this % from the Bayse target.\n\n"
+        "prompt" : (f"📏 *Step 2/6 — Minimum gap %*\n"
                     f"Default: {DEFAULT['min_gap']:.2f}%\n"
-                    "Examples: 0.02 | 0.05 | 0.08 | 0.10\n\n"
-                    "Reply with a number (e.g. `0.05`) or `skip` for default."),
+                    f"Examples: 0.02 | 0.05 | 0.08 | 0.10\n\n"
+                    f"Reply with a number or `skip` for default."),
         "parse"  : float,
         "valid"  : lambda v: 0.0 <= v <= 1.0,
-        "err"    : "Must be between 0.00 and 1.00 (e.g. 0.05)",
+        "err"    : "Must be between 0.00 and 1.00",
     },
     {
         "key"    : "min_payout",
-        "prompt" : ("💰 *Step 3/6 — Minimum payout (optional)*\n"
-                    "Minimum profit per $1 staked. Trades with lower payout are skipped.\n"
-                    "Set to 0 to disable this filter entirely.\n\n"
-                    f"Default: {DEFAULT['min_payout']:.2f} (disabled)\n"
-                    "Example: 0.30 means you need at least $1.30 back per $1 win\n\n"
-                    "Reply with a number (e.g. `0.30`) or `skip`/`0` to disable."),
+        "prompt" : (f"💰 *Step 3/6 — Minimum payout (0 = disabled)*\n"
+                    f"Default: {DEFAULT['min_payout']:.2f}\n"
+                    f"Example: 0.30 = need ≥$1.30 back per $1\n\n"
+                    f"Reply with a number or `skip`/`0` to disable."),
         "parse"  : float,
         "valid"  : lambda v: 0.0 <= v <= 2.0,
-        "err"    : "Must be between 0.00 and 2.00 (0 = disabled)",
+        "err"    : "Must be between 0.00 and 2.00",
     },
     {
         "key"    : "blocked_hours",
-        "prompt" : ("🚫 *Step 4/6 — Block bad hours (optional)*\n"
-                    "UTC hours where the model performs poorly. These rounds are skipped.\n\n"
+        "prompt" : (f"🚫 *Step 4/6 — Block bad hours (optional)*\n"
                     f"Default: none\n"
-                    "Confirmed bad: 2, 4, 9, 13 (all ≤52% WR across 4+ days)\n"
-                    "Example: `2 4 9 13` to block those four hours\n\n"
-                    "Reply with space-separated hours, or `skip`/`none` to disable."),
-        "parse"  : lambda v: [] if v.lower() in ("none","skip","0","") else [int(x) for x in v.split()],
+                    f"Example: `2 4 9 13`\n\n"
+                    f"Reply with space-separated UTC hours or `skip`/`none`."),
+        "parse"  : lambda v: [] if v.lower() in ("none", "skip", "0", "") else [int(x) for x in v.split()],
         "valid"  : lambda v: all(0 <= h <= 23 for h in v),
-        "err"    : "Must be space-separated hours 0–23 (e.g. 2 9 13)",
+        "err"    : "Must be space-separated hours 0–23",
     },
     {
         "key"    : "stake",
-        "prompt" : ("💵 *Step 5/6 — Stake per trade*\n"
-                    "How much to bet on each qualifying signal.\n\n"
+        "prompt" : (f"💵 *Step 5/6 — Stake per trade*\n"
                     f"Default: ${DEFAULT['stake']:.2f}\n"
-                    "Examples: 1 | 2 | 3 | 5\n\n"
-                    "Reply with a number or `skip` for default."),
+                    f"Examples: 1 | 2 | 5\n\n"
+                    f"Reply with a number or `skip` for default."),
         "parse"  : float,
         "valid"  : lambda v: 1.0 <= v <= 1000.0,
         "err"    : "Must be at least $1.00",
     },
     {
         "key"    : "max_losses",
-        "prompt" : ("⚡ *Step 6/6 — Circuit break*\n"
-                    "Pause auto-buy after this many consecutive losses.\n\n"
+        "prompt" : (f"⚡ *Step 6/6 — Circuit break*\n"
                     f"Default: {DEFAULT['max_losses']}\n"
-                    "Examples: 2 | 3 | 5 | 0 (disable)\n\n"
-                    "Reply with a number or `skip` for default."),
+                    f"Examples: 2 | 3 | 5 | 0 (disable)\n\n"
+                    f"Reply with a number or `skip` for default."),
         "parse"  : int,
         "valid"  : lambda v: 0 <= v <= 20,
-        "err"    : "Must be between 0 (disabled) and 20",
+        "err"    : "Must be between 0 and 20",
     },
 ]
 
@@ -633,14 +656,13 @@ def wizard_start(chat):
     wizard_chat   = chat
     wizard_data   = {}
     tg(f"🆕 *New Session Setup*\n{sep()}\n"
-       f"Answer 6 quick questions to configure your session.\n"
+       f"Answer 6 questions to configure your session.\n"
        f"Type `skip` at any step to use the default value.\n"
        f"Type `cancel` to abort.\n{sep()}", chat)
     time.sleep(0.5)
     tg(WIZARD_STEPS[0]["prompt"], chat)
 
 def wizard_handle(text, chat):
-    """Process wizard input. Returns True if wizard consumed the message."""
     global wizard_active, wizard_step, wizard_data, wizard_chat
     global session_num, session_start, session_on, cfg, balance
     global current_stake, total_staked, total_won, paused, circuit_off
@@ -648,7 +670,7 @@ def wizard_handle(text, chat):
     global last_round, round_state
 
     if not wizard_active: return False
-    if chat != wizard_chat: return False  # only respond to wizard initiator
+    if chat != wizard_chat: return False
 
     if text.lower() == "cancel":
         wizard_active = False
@@ -657,8 +679,7 @@ def wizard_handle(text, chat):
 
     step = WIZARD_STEPS[wizard_step]
 
-    if text.lower() in ("skip","default",""):
-        # Use default value
+    if text.lower() in ("skip", "default", ""):
         wizard_data[step["key"]] = DEFAULT[step["key"]]
         tg(f"✅ Using default: `{DEFAULT[step['key']]}`", chat)
     else:
@@ -669,7 +690,7 @@ def wizard_handle(text, chat):
                 return True
             wizard_data[step["key"]] = val
             tg(f"✅ Set to: `{val}`", chat)
-        except Exception as e:
+        except Exception:
             tg(f"❌ Couldn't parse that. {step['err']}\nTry again or type `skip`.", chat)
             return True
 
@@ -680,12 +701,11 @@ def wizard_handle(text, chat):
         tg(WIZARD_STEPS[wizard_step]["prompt"], chat)
         return True
 
-    # All steps done — apply config and start session
+    # All steps done — apply and start new session
     wizard_active = False
     cfg           = wizard_data.copy()
     current_stake = cfg["stake"]
 
-    # Reset session state
     session_num   += 1
     session_start  = datetime.now(timezone.utc)
     session_on     = True
@@ -699,12 +719,11 @@ def wizard_handle(text, chat):
     stats          = {k: 0 for k in stats}
     trade_log      = []
     hour_stats     = defaultdict(lambda: {"total": 0, "correct": 0})
-    last_round     = {"target":None,"close":None,"direction":None,
-                      "correct":None,"resolved":False}
-    round_state    = {"event_id":None,"prev_event_id":None,"start_time":None,
-                      "target":None,"fired":False,"signal":None,"order_id":None}
+    last_round     = {"target": None, "close": None, "direction": None,
+                      "correct": None, "resolved": False}
+    round_state    = {"event_id": None, "prev_event_id": None, "start_time": None,
+                      "target": None, "fired": False, "signal": None, "order_id": None}
 
-    # Summary
     ph = f"blocked {cfg['blocked_hours']}" if cfg["blocked_hours"] else "no hour blocking"
     mp = f"payout≥{cfg['min_payout']:.2f}x" if cfg["min_payout"] > 0 else "no payout filter"
     mode = f"AUTO-BUY ${cfg['stake']:.2f}/trade" if AUTO_BUY else "NOTIFY ONLY"
@@ -717,7 +736,7 @@ def wizard_handle(text, chat):
        f"  Hours      : {ph}\n"
        f"  Stake      : ${cfg['stake']:.2f}\n"
        f"  Circuit    : after {cfg['max_losses']} straight losses\n{sep()}\n"
-       f"Balance reset to $10.00. Bot is running. Good luck! 🎯", chat)
+       f"Balance reset to $10.00. Good luck! 🎯", chat)
     return True
 
 # ─────────────────────────────────────────────────────────────
@@ -729,12 +748,11 @@ def handle_commands():
     global stats, trade_log, hour_stats, last_round, round_state, cfg
 
     for u in tg_poll():
-        msg  = u.get("message",{})
-        raw  = msg.get("text","").strip()
+        msg  = u.get("message", {})
+        raw  = msg.get("text", "").strip()
         text = raw.lower()
-        chat = str(msg.get("chat",{}).get("id",""))
+        chat = str(msg.get("chat", {}).get("id", ""))
 
-        # Wizard takes priority
         if wizard_active:
             if wizard_handle(raw, chat): continue
 
@@ -759,7 +777,7 @@ def handle_commands():
             current_stake = cfg["stake"]
             tg(f"↩️ *Config reset to defaults*\n{sep()}\n"
                f"  {fmt_cfg(cfg)}\n{sep()}\n"
-               f"These will apply from the next signal.", chat)
+               f"Applies from next signal.", chat)
 
         elif text.startswith("/pause"):
             paused = True
@@ -771,8 +789,7 @@ def handle_commands():
 
         elif text.startswith("/playsilent"):
             silent_mode = True
-            tg(f"🔇→📢 *Silent mode ON*\nAlso auto-buying rounds that pass "
-               f"conf+gap but were filtered out.\n/pausesilent to stop.", chat)
+            tg(f"🔇→📢 *Silent mode ON*\n/pausesilent to stop.", chat)
 
         elif text.startswith("/pausesilent"):
             silent_mode = False
@@ -854,10 +871,10 @@ def handle_commands():
             lines = [f"🕐 *Win Rate by Hour — Session #{session_num}*\n{sep()}"]
             for h in sorted(hour_stats.keys()):
                 d  = hour_stats[h]
-                wr = d["correct"]/d["total"]*100 if d["total"] else 0
-                flag = "🔥" if wr==100 else "✅" if wr>=75 else "⚠️" if wr>=52.6 else "❌"
+                wr = d["correct"] / d["total"] * 100 if d["total"] else 0
+                flag = "🔥" if wr == 100 else "✅" if wr >= 75 else "⚠️" if wr >= 52.6 else "❌"
                 blk  = " 🚫" if h in cfg["blocked_hours"] else ""
-                bar  = "█" * int(wr/10)
+                bar  = "█" * int(wr / 10)
                 lines.append(f"  {h:02d}:00{blk} {flag} {bar:<10} {wr:.0f}% ({d['correct']}/{d['total']})")
             lines.append(f"{sep()}\nBreak-even ≈ 52.6%")
             tg("\n".join(lines), chat)
@@ -890,7 +907,6 @@ def handle_commands():
 
         elif text.startswith("/price"):
             btc = btc_live(); tgt = round_state.get("target")
-            mkt = None
             if btc and tgt:
                 diff = btc - tgt
                 tg(f"💰 *BTC Snapshot*\n{sep()}\n"
@@ -904,22 +920,22 @@ def handle_commands():
         elif text.startswith("/export"):
             if not os.path.exists(LOG_FILE):
                 tg("No CSV log yet.", chat); continue
-            with open(LOG_FILE,"rb") as f: data = f.read()
+            with open(LOG_FILE, "rb") as f: data = f.read()
             rows  = data.count(b"\n") - 1
             fname = f"session_{session_num}_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M')}.csv"
             tg_doc(fname, data, f"Session #{session_num} — {rows} signals", chat)
 
         elif text.startswith("/start"):
             mode = f"AUTO-BUY ${current_stake:.2f}/trade" if AUTO_BUY else "NOTIFY ONLY"
-            tg(f"🤖 *Bayse BTC Bot v9*\n"
+            tg(f"🤖 *Bayse BTC Bot v10*\n"
                f"Mode: *{mode}*\n{sep()}\n"
-               f"Every round sends a signal — trade or not.\n"
-               f"Target price is from Bayse API. Gap vs live BTC.\n{sep()}\n"
+               f"Session #{session_num} is *running* with default config.\n"
+               f"Use /startsession to reconfigure anytime.\n{sep()}\n"
                f"*Commands:*\n"
-               f"  /startsession  — configure + start new session\n"
+               f"  /startsession  — reconfigure + restart session\n"
                f"  /stopsession   — end session\n"
-               f"  /default       — reset session config to defaults\n"
-               f"  /config        — show current vs default config\n"
+               f"  /default       — reset config to defaults\n"
+               f"  /config        — current vs default config\n"
                f"  /balance       — live balance\n"
                f"  /price         — BTC vs Bayse target\n"
                f"  /stats         — session stats\n"
@@ -928,8 +944,7 @@ def handle_commands():
                f"  /export        — download CSV\n"
                f"  /pause  /play\n"
                f"  /playsilent  /pausesilent\n"
-               f"  /increase N  /decrease N  /stake\n{sep()}\n"
-               f"Send /startsession to begin!", chat)
+               f"  /increase N  /decrease N  /stake\n", chat)
 
 # ─────────────────────────────────────────────────────────────
 # MAIN LOOP
@@ -941,12 +956,13 @@ def main():
     init_log()
     seed_candles()
 
-    tg(f"🟢 *Bot v9 online*\n"
-       f"  Auto-buy: {'✅ ON' if AUTO_BUY else '⚠️ OFF'}\n"
-       f"  Default config: {fmt_cfg(DEFAULT)}\n\n"
-       f"Send /startsession to configure and start.\n"
-       f"Send /start for full command list.")
-    log.info(f"v9 started | auto_buy={AUTO_BUY}")
+    mode = f"AUTO-BUY ${current_stake:.2f}/trade" if AUTO_BUY else "NOTIFY ONLY"
+    tg(f"🟢 *Bot v10 online — Session #1 auto-started*\n"
+       f"  Mode   : {mode}\n"
+       f"  Config : {fmt_cfg(DEFAULT)}\n\n"
+       f"Trading starts immediately with default settings.\n"
+       f"/startsession to reconfigure | /start for all commands.")
+    log.info(f"v10 started | auto_buy={AUTO_BUY} | session_on=True")
 
     while True:
         try:
@@ -963,13 +979,13 @@ def main():
 
             event_id     = market["event_id"]
             btc          = btc_live()
-            bayse_target = market.get("bayse_target")  # Bayse's own price target
+            bayse_target = market.get("bayse_target")   # from Bayse API only
             end_dt       = parse_end_dt(market["rules"], now)
-            mins_left    = round((end_dt - now).total_seconds()/60, 1) if end_dt else None
+            mins_left    = round((end_dt - now).total_seconds() / 60, 1) if end_dt else None
 
             # ── NEW ROUND ─────────────────────────────────────
             if event_id != round_state["event_id"]:
-                log.info(f"New round: {event_id} | bayse_target=${bayse_target}")
+                log.info(f"New round: {event_id} | bayse_target={bayse_target}")
 
                 prev_sig    = round_state.get("signal")
                 prev_target = round_state.get("target")
@@ -1000,23 +1016,22 @@ def main():
                             stats["total"] += 1
                             if correct:
                                 stats["wins"] += 1; consec_losses = 0
-                                earned        = round(used_stake * prev_sig["payout"], 2)
-                                total_won    += earned
-                                total_staked += used_stake
-                                balance       = round(balance + earned - used_stake, 2)
+                                earned         = round(used_stake * prev_sig["payout"], 2)
+                                total_won     += earned
+                                total_staked  += used_stake
+                                balance        = round(balance + earned - used_stake, 2)
                                 if circuit_off:
                                     circuit_off = False
                                     tg("✅ *Win — circuit break cleared. Signals resuming.*")
                             else:
                                 stats["losses"] += 1; consec_losses += 1
-                                total_staked += used_stake
-                                balance       = round(balance - used_stake, 2)
+                                total_staked   += used_stake
+                                balance         = round(balance - used_stake, 2)
                                 if consec_losses >= cfg["max_losses"] and not circuit_off:
                                     circuit_off = True; stats["breaks"] += 1
                                     tg(f"⚡ *Circuit break — {cfg['max_losses']} straight losses*\n"
                                        f"Balance: ${balance:.2f}\n/play to resume manually")
 
-                            # Sync from Bayse API
                             api_bal = fetch_balance_api()
                             if api_bal is not None:
                                 balance = api_bal
@@ -1034,7 +1049,7 @@ def main():
                             "time"         : now.strftime("%H:%M"),
                             "hour"         : hour_h,
                             "bayse_target" : prev_target,
-                            "btc_live"     : prev_sig.get("btc",""),
+                            "btc_live"     : prev_sig.get("btc", ""),
                             "close"        : final,
                             "direction"    : prev_sig["direction"],
                             "actual"       : actual_dir,
@@ -1045,7 +1060,7 @@ def main():
                             "gap_pct"      : prev_sig["gap_pct"],
                             "traded"       : traded,
                             "stake"        : used_stake if traded else "",
-                            "order_id"     : round_state.get("order_id",""),
+                            "order_id"     : round_state.get("order_id", ""),
                             "session"      : session_num,
                             "balance_after": balance if traded else "",
                         })
@@ -1061,11 +1076,15 @@ def main():
                                  f"traded={traded} | balance=${balance:.2f}")
 
                 # ── SET NEW ROUND ─────────────────────────────
-                # Target is always from Bayse API (bayse_target field)
+                # Use Bayse API target; if missing, fall back to live BTC with warning
                 new_target = bayse_target
                 if not new_target:
                     new_target = btc
-                    log.warning(f"Bayse target not available — using live btc ${new_target:,.2f}")
+                    log.warning(
+                        f"Bayse target unavailable for event {event_id} — "
+                        f"falling back to live BTC ${new_target:,.2f}. "
+                        f"Check Railway logs for '[target]' lines to debug."
+                    )
 
                 round_state.update({
                     "event_id"     : event_id,
@@ -1115,7 +1134,6 @@ def main():
                             else:
                                 stats["orders_fail"] += 1
 
-                        # Always send signal
                         tg(msg_signal_card(sig, traded=should_trade,
                                            order_id=order_id, silent=silent_trade))
                         if order: tg(msg_receipt(order, sig))
