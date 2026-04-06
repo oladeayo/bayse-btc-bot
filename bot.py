@@ -803,7 +803,6 @@ def handle_commands():
                f"  /increase N  |  /decrease N", chat)
 
         elif text.startswith("/balance"):
-            global balance
             api = fetch_balance_api()
             if api is not None: balance = api; src = "Bayse API ✅"
             else: src = "internal tracker ⚠️"
